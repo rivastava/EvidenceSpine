@@ -2,6 +2,7 @@
 
 This project includes a reproducible local benchmark harness:
 - `benchmarks/bench_evidencespine.py`
+- `benchmarks/apples_to_apples_compare.py`
 
 It measures:
 1. Ingest latency and throughput (`events/sec`, p50, p95)
@@ -37,3 +38,16 @@ PYTHONPATH=src python benchmarks/bench_evidencespine.py \
 1. `hybrid`/`vector` can be slower than `lexical` because they add vector scoring.
 2. Focus on p95 latency and throughput, not single-run p50 only.
 3. Run multiple seeds/hardware profiles before making product claims.
+
+See apples-to-apples guide:
+- `docs/APPLE_TO_APPLE_COMPARISON.md`
+
+## Published snapshot
+
+Latest checked-in apples-to-apples snapshot:
+- `docs/benchmarks/apples_to_apples_2026-02-28.json`
+- `docs/benchmarks/apples_to_apples_2026-02-28.md`
+
+Notes for this snapshot:
+1. `mem0` run used `qdrant-client==1.13.3` for compatibility with installed `mem0` APIs.
+2. `letta` run used a local Letta server process in benchmark mode.

@@ -105,6 +105,7 @@ See:
 - `docs/ARCHITECTURE.md`
 - `docs/INTEGRATION.md`
 - `docs/BENCHMARKS.md`
+- `docs/APPLE_TO_APPLE_COMPARISON.md`
 
 ## Benchmarks
 
@@ -118,6 +119,22 @@ PYTHONPATH=src python benchmarks/bench_evidencespine.py \
   --handoffs 40 \
   --out benchmarks/results/latest.json
 ```
+
+Apples-to-apples comparison:
+
+```bash
+cd oss/evidencespine
+PYTHONPATH=src python benchmarks/apples_to_apples_compare.py \
+  --events 1200 \
+  --queries 80 \
+  --handoffs 30 \
+  --out-json benchmarks/results/apples_to_apples.json \
+  --out-md benchmarks/results/apples_to_apples.md
+```
+
+Published benchmark snapshot:
+- `docs/benchmarks/apples_to_apples_2026-02-28.json`
+- `docs/benchmarks/apples_to_apples_2026-02-28.md`
 
 ## Release checklist
 - [x] Installable package (`pyproject.toml`)

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.bench_venv/
 dist/
 build/
 *.egg-info/
@@ -9,3 +10,4 @@ build/
 .evidencespine*/
 benchmarks/runs/
 benchmarks/results/
+openapi_letta.json
