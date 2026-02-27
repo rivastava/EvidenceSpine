@@ -104,6 +104,20 @@ See:
 - `docs/PROTOCOL.md`
 - `docs/ARCHITECTURE.md`
 - `docs/INTEGRATION.md`
+- `docs/BENCHMARKS.md`
+
+## Benchmarks
+
+Run benchmark harness:
+
+```bash
+cd oss/evidencespine
+PYTHONPATH=src python benchmarks/bench_evidencespine.py \
+  --events 2000 \
+  --brief-queries 100 \
+  --handoffs 40 \
+  --out benchmarks/results/latest.json
+```
 
 ## Release checklist
 - [x] Installable package (`pyproject.toml`)

@@ -7,3 +7,5 @@ build/
 *.egg-info/
 .evidencespine/
 .evidencespine*/
+benchmarks/runs/
+benchmarks/results/

@@ -13,6 +13,12 @@ python -m build
 python -m twine check dist/*
 ```
 
+Optional benchmark artifact:
+
+```bash
+PYTHONPATH=src python benchmarks/bench_evidencespine.py --out benchmarks/results/latest.json
+```
+
 ## 2) Create GitHub repo
 - Create a new public repo, e.g. `evidencespine`.
 - Push this folder as repo root.
