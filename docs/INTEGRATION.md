@@ -95,3 +95,9 @@ ag.ingest_messages([{"source": "assistant", "content": "Patch complete"}])
 - Generate brief before each major agent action.
 - Emit handoff packet when switching role/agent.
 - Watch `snapshot()` metrics for stale or low citation coverage.
+
+## Claude Code
+
+For a Claude Code specific workflow, see:
+- `docs/CLAUDE_CODE.md`
+- `examples/claude_code_usage.py`

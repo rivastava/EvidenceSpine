@@ -87,6 +87,7 @@ ag = AutoGenAdapter(rt)
 
 See:
 - `examples/multi_agent_handoff.py`
+- `examples/claude_code_usage.py`
 - `docs/INTEGRATION.md`
 
 ## Storage layout
@@ -104,6 +105,7 @@ See:
 - `docs/PROTOCOL.md`
 - `docs/ARCHITECTURE.md`
 - `docs/INTEGRATION.md`
+- `docs/CLAUDE_CODE.md`
 - `docs/BENCHMARKS.md`
 - `docs/APPLE_TO_APPLE_COMPARISON.md`
 
