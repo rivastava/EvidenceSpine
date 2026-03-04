@@ -1,0 +1,27 @@
+[
+  {
+    "id": "u1",
+    "role": "user",
+    "content": "Investigate why the deploy pipeline is stalling."
+  },
+  {
+    "id": "a1",
+    "role": "assistant",
+    "content": "I will inspect the deployment logs and look for blocked steps."
+  },
+  {
+    "id": "tool_1",
+    "role": "tool",
+    "content": "kubectl rollout status timed out after 600 seconds"
+  },
+  {
+    "id": "tool_2",
+    "role": "function",
+    "content": "Previous rollout shows init container waiting on missing secret 'prod-app-config'."
+  },
+  {
+    "id": "a2",
+    "role": "assistant",
+    "content": "The deployment is blocked by a missing secret; operator must restore prod-app-config before retrying."
+  }
+]

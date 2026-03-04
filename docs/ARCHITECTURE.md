@@ -17,6 +17,14 @@ Provide shared memory continuity across agent sessions without stuffing full log
 
 Each event can generate one or more fact candidates.
 
+## Adapter pipeline
+
+Recommended integration path:
+
+`messages[] / state -> TranscriptAdapter normalization -> ingest_event -> fact extraction -> brief / handoff`
+
+Framework wrappers (`LangGraphAdapter`, `AutoGenAdapter`) are thin schema-level layers on top of this transcript adapter pipeline. This keeps the package dependency-free while making adapter transformations testable outside runtime writes.
+
 ## Storage
 Default base dir: `.evidencespine/`
 - `events.jsonl`
@@ -35,6 +43,7 @@ Default base dir: `.evidencespine/`
 These hooks allow plugging EvidenceSpine into any orchestrator.
 
 Framework adapters provided:
+- `evidencespine.adapters.TranscriptAdapter`
 - `evidencespine.adapters.LangGraphAdapter`
 - `evidencespine.adapters.AutoGenAdapter`
 

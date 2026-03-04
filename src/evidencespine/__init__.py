@@ -9,7 +9,14 @@ from evidencespine.protocol import (
 from evidencespine.runtime import AgentMemoryRuntime, AgentMemoryRuntimeConfig, RuntimeHooks
 from evidencespine.settings import EvidenceSpineSettings
 from evidencespine.vector_backends import HashingVectorBackend, VectorBackend
-from evidencespine.adapters import AutoGenAdapter, LangGraphAdapter
+from evidencespine.adapters import (
+    AdapterIngestResult,
+    AutoGenAdapter,
+    LangGraphAdapter,
+    NormalizedTranscriptMessage,
+    TranscriptAdapter,
+    TranscriptAdapterConfig,
+)
 
 __all__ = [
     "AgentMemoryEvent",
@@ -24,4 +31,8 @@ __all__ = [
     "HashingVectorBackend",
     "LangGraphAdapter",
     "AutoGenAdapter",
+    "TranscriptAdapter",
+    "NormalizedTranscriptMessage",
+    "TranscriptAdapterConfig",
+    "AdapterIngestResult",
 ]

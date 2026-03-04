@@ -74,7 +74,31 @@ class MyVectorBackend:
 runtime = AgentMemoryRuntime(vector_backend=MyVectorBackend())
 ```
 
-## 6) Framework adapters (drop-in)
+## 6) Transcript-first integration (recommended)
+
+```python
+from evidencespine import AgentMemoryRuntime, EvidenceSpineSettings
+from evidencespine.adapters import TranscriptAdapter
+
+rt = AgentMemoryRuntime(config=EvidenceSpineSettings.from_env().to_runtime_config())
+adapter = TranscriptAdapter(rt, default_thread_id="thread_default")
+
+normalized = adapter.normalize_messages(
+    [
+        {"role": "user", "content": "Check drift"},
+        {"role": "assistant", "content": "Patch complete"},
+        {"role": "tool", "content": "pytest passed"},
+    ]
+)
+
+result = adapter.ingest_messages(normalized)
+brief = adapter.brief("what matters now")
+handoff = adapter.handoff("auditor", "verify latest claims")
+```
+
+Use this when your runtime already exposes transcript-like `messages[]` and you want the smallest dependency-free integration surface.
+
+## 7) Framework wrappers (drop-in convenience)
 
 ```python
 from evidencespine import AgentMemoryRuntime, EvidenceSpineSettings
@@ -84,12 +108,27 @@ rt = AgentMemoryRuntime(config=EvidenceSpineSettings.from_env().to_runtime_confi
 
 lg = LangGraphAdapter(rt, default_thread_id="thread_lg")
 lg.ingest_state({"messages": [{"role": "user", "content": "Check drift"}]})
+normalized_lg = lg.normalize_state({"messages": [{"role": "tool", "content": "pytest ok"}]})
 
 ag = AutoGenAdapter(rt, default_thread_id="thread_ag")
 ag.ingest_messages([{"source": "assistant", "content": "Patch complete"}])
+normalized_ag = ag.normalize_messages([{"source": "function", "content": "tool output"}])
 ```
 
-## 7) Operational checklist
+These wrappers stay dependency-free. They are schema-level adapters, not hard integrations with the framework packages.
+
+## 8) Replay validation
+
+Run the bundled replay examples to inspect how raw traces become briefs and handoff packets:
+
+```bash
+PYTHONPATH=src python examples/transcript_replay_harness.py \
+  examples/replay_fixtures/implementer_auditor_trace.json
+
+PYTHONPATH=src python examples/langgraph_replay_demo.py
+```
+
+## 9) Operational checklist
 - Persist events with evidence refs.
 - Mark fact state correctly (asserted vs verified).
 - Generate brief before each major agent action.
@@ -101,3 +140,4 @@ ag.ingest_messages([{"source": "assistant", "content": "Patch complete"}])
 For a Claude Code specific workflow, see:
 - `docs/CLAUDE_CODE.md`
 - `examples/claude_code_usage.py`
+- `docs/ADAPTERS.md`

@@ -9,7 +9,7 @@ It provides:
 - Fail-open behavior (memory failures do not block the caller)
 - Optional governance hooks for contradiction checks and external policy systems
 - Hybrid retrieval mode (`lexical|hybrid|vector`) with pluggable vector backend
-- Drop-in adapters for LangGraph-style state and AutoGen-style transcripts
+- Transcript-first adapters for plain `messages[]`, with LangGraph and AutoGen wrappers built on top
 
 ## Why this exists
 Most agent-memory systems store context. EvidenceSpine adds strict claim quality controls:
@@ -74,20 +74,23 @@ export EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT=0.35
 By default hybrid uses an internal hashing vector backend (dependency-free).  
 You can inject your own backend by implementing `score_texts(query, texts) -> scores`.
 
-## Framework adapters
+## Transcript-first integration
 
 ```python
 from evidencespine import AgentMemoryRuntime, EvidenceSpineSettings
-from evidencespine.adapters import LangGraphAdapter, AutoGenAdapter
+from evidencespine.adapters import TranscriptAdapter, LangGraphAdapter, AutoGenAdapter
 
 rt = AgentMemoryRuntime(config=EvidenceSpineSettings.from_env().to_runtime_config())
+ta = TranscriptAdapter(rt)
 lg = LangGraphAdapter(rt)
 ag = AutoGenAdapter(rt)
 ```
 
 See:
+- `docs/ADAPTERS.md`
 - `examples/multi_agent_handoff.py`
 - `examples/claude_code_usage.py`
+- `examples/transcript_replay_harness.py`
 - `docs/INTEGRATION.md`
 
 ## Storage layout
@@ -104,6 +107,7 @@ Use `--base-dir` or `EVIDENCESPINE_BASE_DIR` to override.
 See:
 - `docs/PROTOCOL.md`
 - `docs/ARCHITECTURE.md`
+- `docs/ADAPTERS.md`
 - `docs/INTEGRATION.md`
 - `docs/CLAUDE_CODE.md`
 - `docs/BENCHMARKS.md`
@@ -142,7 +146,8 @@ Published benchmark snapshot:
 - [x] Installable package (`pyproject.toml`)
 - [x] Source-available noncommercial license
 - [x] CLI and examples
-- [x] Basic tests
+- [x] Replay-backed adapter examples
+- [x] Adapter normalization contract
 - [x] Documentation
 
 ## License

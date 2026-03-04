@@ -1,0 +1,22 @@
+[
+  {
+    "id": "u1",
+    "role": "user",
+    "content": "Confirm whether we should use region us-east-1 for staging."
+  },
+  {
+    "id": "a1",
+    "role": "assistant",
+    "content": "Use region us-east-1 for staging."
+  },
+  {
+    "id": "a2",
+    "role": "assistant",
+    "content": "Hold change rollout until the environment mismatch is reviewed."
+  },
+  {
+    "id": "tool_1",
+    "role": "tool",
+    "content": "Config audit found staging replicas still pinned to us-west-2."
+  }
+]

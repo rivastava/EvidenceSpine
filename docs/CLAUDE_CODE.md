@@ -81,6 +81,25 @@ Use that brief in the next Claude Code prompt instead of pasting a long raw thre
 
 If you want markdown-style output, render the dictionary into your preferred prompt format before sending it to Claude.
 
+## Optional transcript import path
+
+If you already have a raw transcript-like `messages[]` payload and want to import it into EvidenceSpine before building the brief, use `TranscriptAdapter`:
+
+```python
+from evidencespine.adapters import TranscriptAdapter
+
+adapter = TranscriptAdapter(runtime, default_thread_id="bugfix_auth_timeout")
+adapter.ingest_messages(
+    [
+        {"role": "user", "content": "Audit the timeout regression"},
+        {"role": "assistant", "content": "Patched retry middleware only"},
+        {"role": "tool", "content": "pytest passed"},
+    ]
+)
+```
+
+This is the recommended default when integrating from transcript-oriented tools because it keeps the transform explicit and replayable.
+
 ## Emit a handoff packet
 
 ```python
@@ -174,6 +193,8 @@ Do not use EvidenceSpine as:
 
 See:
 - `examples/claude_code_usage.py`
+- `examples/transcript_replay_harness.py`
+- `docs/ADAPTERS.md`
 
 ## Operational checklist
 
