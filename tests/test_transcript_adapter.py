@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,3 +80,24 @@ def test_transcript_adapter_turn_id_generation_is_stable(tmp_path: Path) -> None
         {"role": "assistant", "content": "two"},
     ])
     assert [r.turn_id for r in rows] == ["msg_0", "msg_1"]
+
+
+def test_transcript_adapter_preserves_caller_evidence_items(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    adapter = TranscriptAdapter(runtime, default_thread_id="demo")
+    rows = adapter.normalize_messages(
+        [
+            {
+                "id": "m1",
+                "role": "assistant",
+                "content": "Patch complete",
+                "evidence_items": [{"source_id": "src/file.py", "line_start": 22, "line_end": 24}],
+            }
+        ]
+    )
+    assert rows[0].evidence_items[0]["source_id"] == "src/file.py"
+
+    adapter.ingest_messages(rows)
+    events_path = tmp_path / ".es" / "events.jsonl"
+    latest = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert latest["evidence_items"][0]["source_id"] == "src/file.py"

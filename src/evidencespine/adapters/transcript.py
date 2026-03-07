@@ -7,7 +7,7 @@ from evidencespine.adapters.base import (
     NormalizedTranscriptMessage,
     TranscriptAdapterConfig,
 )
-from evidencespine.protocol import safe_float, safe_text
+from evidencespine.protocol import merge_evidence_refs, normalize_evidence_items, safe_float, safe_text
 from evidencespine.runtime import AgentMemoryRuntime
 
 
@@ -96,7 +96,7 @@ class TranscriptAdapter:
 
     def _extract_metadata(self, msg: Any, *, canonical_role: str) -> dict[str, Any]:
         if isinstance(msg, dict):
-            raw = {k: v for k, v in msg.items() if k not in {"content", "text"}}
+            raw = {k: v for k, v in msg.items() if k not in {"content", "text", "evidence_ref", "evidence_refs", "evidence_items"}}
         else:
             raw = {
                 "raw_type": type(msg).__name__,
@@ -109,6 +109,23 @@ class TranscriptAdapter:
     def _event_type_for_role(self, role: str) -> str:
         role_key = safe_text(role, "unknown", 64).lower()
         return self.config.event_type_by_role.get(role_key, "reflection")
+
+    def _extract_evidence_refs(self, msg: Any, *, default_ref: str) -> list[str]:
+        if isinstance(msg, dict):
+            refs = msg.get("evidence_refs", msg.get("evidence_ref", []))
+        else:
+            refs = getattr(msg, "evidence_refs", getattr(msg, "evidence_ref", []))
+        merged = merge_evidence_refs(refs)
+        if merged:
+            return merged
+        return [default_ref]
+
+    def _extract_evidence_items(self, msg: Any) -> list[dict[str, Any]]:
+        if isinstance(msg, dict):
+            raw = msg.get("evidence_items", [])
+        else:
+            raw = getattr(msg, "evidence_items", [])
+        return normalize_evidence_items(raw)
 
     def normalize_messages(self, messages_or_state: Any) -> List[NormalizedTranscriptMessage]:
         normalized: List[NormalizedTranscriptMessage] = []
@@ -127,6 +144,8 @@ class TranscriptAdapter:
                     evidence_ref=f"{self.config.evidence_prefix}:{turn_id}",
                     confidence=safe_float(self.config.default_confidence, 0.6, 0.0, 1.0),
                     salience=safe_float(self.config.default_salience, 0.5, 0.0, 1.0),
+                    evidence_refs=self._extract_evidence_refs(msg, default_ref=f"{self.config.evidence_prefix}:{turn_id}"),
+                    evidence_items=self._extract_evidence_items(msg),
                     metadata=self._extract_metadata(msg, canonical_role=role),
                 )
             )
@@ -150,7 +169,8 @@ class TranscriptAdapter:
                         "claim": row.content,
                         "fact_state": "asserted",
                     },
-                    "evidence_refs": [row.evidence_ref],
+                    "evidence_refs": merge_evidence_refs(row.evidence_refs or [row.evidence_ref], row.evidence_items),
+                    "evidence_items": normalize_evidence_items(row.evidence_items),
                     "confidence": row.confidence,
                     "salience": row.salience,
                     "metadata": dict(row.metadata),

@@ -17,8 +17,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
-import requests
+try:
+    import requests
+except Exception:  # pragma: no cover - optional benchmark dependency
+    requests = None
 
+from evidencespine.protocol import ClaimCitation, evidence_item_excerpt_matches_checksum, has_grounded_span
 from evidencespine.runtime import AgentMemoryRuntime
 from evidencespine.settings import EvidenceSpineSettings
 
@@ -50,6 +54,13 @@ def _rand_token(n: int = 8) -> str:
 
 def _mk_event(i: int) -> Dict[str, Any]:
     segment = f"segment_{i % 13}"
+    claim = f"decision {i} about {_rand_token(6)} {_rand_token(5)} {segment} status {_rand_token(4)}"
+    source_id = f"bench/file_{i % 17}.md"
+    line_start = i % 100 + 1
+    line_end = line_start + 1
+    excerpt = claim[:160]
+    checksum = f"sha256:{hashlib.sha256(excerpt.encode('utf-8')).hexdigest()}"
+    evidence_ref = f"{source_id}#L{line_start}-L{line_end}"
     return {
         "thread_id": "bench_thread",
         "event_type": "decision" if i % 3 else "outcome",
@@ -57,14 +68,25 @@ def _mk_event(i: int) -> Dict[str, Any]:
         "source_agent_id": "bench_runner",
         "source_turn_id": f"turn_{i}",
         "payload": {
-            "claim": f"decision {i} about {_rand_token(6)} {_rand_token(5)} {segment} status {_rand_token(4)}",
+            "claim": claim,
             "fact_state": "verified" if i % 7 == 0 else "asserted",
             "decision": f"apply_patch_{i % 7}",
             "outcome": "ok" if i % 4 else "needs_review",
             "next_actions": [f"validate_{i % 9}", f"audit_{i % 6}"],
             "target": f"target_{i % 11}",
         },
-        "evidence_refs": [f"bench/file_{i % 17}.md#L{i % 100 + 1}"],
+        "evidence_refs": [evidence_ref],
+        "evidence_items": [
+            {
+                "source_id": source_id,
+                "locator": evidence_ref,
+                "line_start": line_start,
+                "line_end": line_end,
+                "excerpt": excerpt,
+                "checksum": checksum,
+                "verification_state": "verified" if i % 7 == 0 else "asserted",
+            }
+        ],
         "confidence": 0.7,
         "salience": 0.6,
     }
@@ -112,7 +134,8 @@ def _build_brief_from_records(query: str, records: Sequence[Dict[str, Any]], *, 
     recent_verified_facts: List[str] = []
     active_risks: List[str] = []
     open_items: List[str] = []
-    citations: Dict[str, List[str]] = {}
+    citations: Dict[str, Dict[str, Any]] = {}
+    citation_refs: Dict[str, List[str]] = {}
 
     for row in top:
         claim = str(row.get("claim", "")).strip()
@@ -123,7 +146,9 @@ def _build_brief_from_records(query: str, records: Sequence[Dict[str, Any]], *, 
         if decision:
             line = f"{decision} [ref:{ref}]"
             locked_decisions.append(line)
-            citations[line] = [ref]
+            citation = ClaimCitation.from_value({"primary_ref": ref, "evidence_refs": [ref], "evidence_items": []}, fallback_ref=ref)
+            citations[line] = citation.to_dict()
+            citation_refs[line] = list(citation)
 
         if claim:
             line = f"{claim} [ref:{ref}]"
@@ -133,10 +158,12 @@ def _build_brief_from_records(query: str, records: Sequence[Dict[str, Any]], *, 
                 active_risks.append(line)
             else:
                 open_items.append(line)
-            citations[line] = [ref]
+            citation = ClaimCitation.from_value({"primary_ref": ref, "evidence_refs": [ref], "evidence_items": []}, fallback_ref=ref)
+            citations[line] = citation.to_dict()
+            citation_refs[line] = list(citation)
 
     return {
-        "schema_version": "v1",
+        "schema_version": "v2",
         "thread_id": "bench_thread",
         "query": query,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -148,17 +175,38 @@ def _build_brief_from_records(query: str, records: Sequence[Dict[str, Any]], *, 
         "open_items": open_items[:24],
         "next_actions": [],
         "citations": citations,
+        "citation_refs": citation_refs,
         "metadata": dict(metadata or {}),
     }
 
 
 def _handoff_from_brief(brief: Dict[str, Any], scope: str, *, packet_id_prefix: str, checksum_prefix: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    claims = [
-        {"claim": c, "evidence_refs": brief.get("citations", {}).get(c, []), "status": "asserted"}
-        for c in brief.get("open_items", [])[:24]
-    ]
+    claims = []
+    for claim in brief.get("open_items", [])[:24]:
+        citation = ClaimCitation.from_value(brief.get("citations", {}).get(claim, []), fallback_ref=claim)
+        claims.append(
+            {
+                "claim": claim,
+                "evidence_refs": list(citation),
+                "evidence_items": list(citation.evidence_items),
+                "span_grounded": bool(citation.span_grounded),
+                "status": "asserted",
+            }
+        )
+    unresolved = []
+    for claim in brief.get("active_risks", [])[:24]:
+        citation = ClaimCitation.from_value(brief.get("citations", {}).get(claim, []), fallback_ref=claim)
+        unresolved.append(
+            {
+                "claim": claim,
+                "reason": "unresolved_contradiction",
+                "evidence_refs": list(citation),
+                "evidence_items": list(citation.evidence_items),
+                "span_grounded": bool(citation.span_grounded),
+            }
+        )
     payload = {
-        "schema_version": "v1",
+        "schema_version": "v2",
         "packet_id": f"{packet_id_prefix}_{int(time.time() * 1000)}",
         "role": "auditor",
         "thread_id": "bench_thread",
@@ -166,9 +214,10 @@ def _handoff_from_brief(brief: Dict[str, Any], scope: str, *, packet_id_prefix: 
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "locked_decisions": brief.get("locked_decisions", []),
         "claims": claims,
-        "unresolved_contradictions": brief.get("active_risks", []),
+        "unresolved_contradictions": unresolved,
         "required_validations": [f"Validate scope: {scope}"],
-        "evidence_refs": sorted({r for c in claims for r in c.get("evidence_refs", [])}),
+        "evidence_refs": sorted({r for c in claims + unresolved for r in c.get("evidence_refs", [])}),
+        "evidence_items": [item for c in claims + unresolved for item in c.get("evidence_items", [])],
         "source_snapshot": {"runner": checksum_prefix},
         "metadata": dict(metadata or {}),
     }
@@ -185,7 +234,7 @@ def _extract_claim_rows(section_values: Sequence[Any]) -> List[str]:
     return out
 
 
-def _brief_claim_citation_coverage(brief: Dict[str, Any]) -> Tuple[int, int]:
+def _brief_grounding_metrics(brief: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
     citations = brief.get("citations", {}) if isinstance(brief.get("citations", {}), dict) else {}
     claims: List[str] = []
     for key in [
@@ -198,11 +247,34 @@ def _brief_claim_citation_coverage(brief: Dict[str, Any]) -> Tuple[int, int]:
     ]:
         claims.extend(_extract_claim_rows(brief.get(key, []) if isinstance(brief.get(key, []), list) else []))
     total = len(claims)
-    covered = 0
+    ref_covered = 0
+    span_covered = 0
+    excerpt_total = 0
+    excerpt_covered = 0
     for claim in claims:
-        refs = citations.get(claim, []) if isinstance(citations, dict) else []
-        if isinstance(refs, list) and len(refs) > 0:
-            covered += 1
+        citation = ClaimCitation.from_value(citations.get(claim, []), fallback_ref=claim)
+        if len(citation) > 0:
+            ref_covered += 1
+        if citation.span_grounded:
+            span_covered += 1
+        item = citation.primary_evidence_item()
+        if item and str(item.get("excerpt", "")).strip():
+            excerpt_total += 1
+            if evidence_item_excerpt_matches_checksum(item):
+                excerpt_covered += 1
+    return total, ref_covered, span_covered, excerpt_total, excerpt_covered
+
+
+def _handoff_span_grounding(packet: Dict[str, Any]) -> Tuple[int, int]:
+    total = 0
+    covered = 0
+    for key in ("claims", "unresolved_contradictions"):
+        for row in packet.get(key, []) if isinstance(packet.get(key, []), list) else []:
+            if not isinstance(row, dict):
+                continue
+            total += 1
+            if bool(row.get("span_grounded")) or has_grounded_span(row.get("evidence_items")):
+                covered += 1
     return total, covered
 
 
@@ -717,7 +789,11 @@ class RunnerMetrics:
     handoff_p50_ms: float = 0.0
     handoff_p95_ms: float = 0.0
     brief_claim_citation_coverage: float = 0.0
+    brief_claim_ref_citation_coverage: float = 0.0
+    brief_claim_span_citation_coverage: float = 0.0
+    brief_claim_excerpt_fidelity: float = 0.0
     handoff_completeness_rate: float = 0.0
+    handoff_claim_span_grounding_rate: float = 0.0
     handoff_checksum_rate: float = 0.0
     verified_probe_hit: float = 0.0
     contradiction_probe_hit: float = 0.0
@@ -743,6 +819,8 @@ def _build_runner(name: str, root: Path) -> Runner:
             reason = str(exc).strip().lower().replace(" ", "_")
             return SkippedRunner("mem0", f"mem0_init_failed:{reason[:160]}")
     if n == "letta":
+        if requests is None:
+            return SkippedRunner("letta", "letta_init_failed:missing_requests")
         try:
             __import__("letta")
             return LettaRunner(base_dir=root / n)
@@ -767,20 +845,28 @@ def _evaluate_runner(runner: Runner, *, events: int, queries: int, handoffs: int
 
     brief_lat: List[float] = []
     brief_claim_total = 0
-    brief_claim_covered = 0
+    brief_claim_ref_covered = 0
+    brief_claim_span_covered = 0
+    brief_excerpt_total = 0
+    brief_excerpt_covered = 0
     t1 = time.perf_counter()
     for i in range(queries):
         s = time.perf_counter()
         b = runner.brief(_mk_query(i))
         brief_lat.append((time.perf_counter() - s) * 1000.0)
-        total, covered = _brief_claim_citation_coverage(b if isinstance(b, dict) else {})
+        total, ref_covered, span_covered, excerpt_total, excerpt_covered = _brief_grounding_metrics(b if isinstance(b, dict) else {})
         brief_claim_total += total
-        brief_claim_covered += covered
+        brief_claim_ref_covered += ref_covered
+        brief_claim_span_covered += span_covered
+        brief_excerpt_total += excerpt_total
+        brief_excerpt_covered += excerpt_covered
     brief_total_ms = (time.perf_counter() - t1) * 1000.0
 
     handoff_lat: List[float] = []
     handoff_complete = 0
     handoff_checksum = 0
+    handoff_span_total = 0
+    handoff_span_covered = 0
     t2 = time.perf_counter()
     for i in range(handoffs):
         s = time.perf_counter()
@@ -792,6 +878,9 @@ def _evaluate_runner(runner: Runner, *, events: int, queries: int, handoffs: int
         checksum = str(p_dict.get("checksum", "")).strip()
         if checksum and checksum != "baseline_sqlite_no_checksum":
             handoff_checksum += 1
+        span_total, span_covered = _handoff_span_grounding(p_dict)
+        handoff_span_total += span_total
+        handoff_span_covered += span_covered
     handoff_total_ms = (time.perf_counter() - t2) * 1000.0
 
     # Probe checks: verify whether runners preserve semantic state quality.
@@ -838,11 +927,14 @@ def _evaluate_runner(runner: Runner, *, events: int, queries: int, handoffs: int
     snap = runner.snapshot() if hasattr(runner, "snapshot") else {}
     runner.close()
 
-    citation_cov = (float(brief_claim_covered / max(1, brief_claim_total)) if brief_claim_total > 0 else 0.0)
+    citation_cov = (float(brief_claim_ref_covered / max(1, brief_claim_total)) if brief_claim_total > 0 else 0.0)
+    span_cov = (float(brief_claim_span_covered / max(1, brief_claim_total)) if brief_claim_total > 0 else 0.0)
+    excerpt_fidelity = (float(brief_excerpt_covered / max(1, brief_excerpt_total)) if brief_excerpt_total > 0 else 0.0)
     handoff_comp = float(handoff_complete / max(1, handoffs))
+    handoff_span = float(handoff_span_covered / max(1, handoff_span_total)) if handoff_span_total > 0 else 0.0
     checksum_rate = float(handoff_checksum / max(1, handoffs))
     governance_score = float(
-        (citation_cov + handoff_comp + checksum_rate + verified_hit + contradicted_hit) / 5.0
+        (citation_cov + span_cov + excerpt_fidelity + handoff_comp + handoff_span + checksum_rate + verified_hit + contradicted_hit) / 8.0
     )
 
     return RunnerMetrics(
@@ -861,7 +953,11 @@ def _evaluate_runner(runner: Runner, *, events: int, queries: int, handoffs: int
         handoff_p50_ms=_q(handoff_lat, 0.50),
         handoff_p95_ms=_q(handoff_lat, 0.95),
         brief_claim_citation_coverage=citation_cov,
+        brief_claim_ref_citation_coverage=citation_cov,
+        brief_claim_span_citation_coverage=span_cov,
+        brief_claim_excerpt_fidelity=excerpt_fidelity,
         handoff_completeness_rate=handoff_comp,
+        handoff_claim_span_grounding_rate=handoff_span,
         handoff_checksum_rate=checksum_rate,
         verified_probe_hit=verified_hit,
         contradiction_probe_hit=contradicted_hit,
@@ -881,18 +977,21 @@ def _write_markdown(payload: Dict[str, Any], path: Path) -> None:
     lines.append(f"- handoffs: {params.get('handoffs')}")
     lines.append(f"- seed: {params.get('seed')}")
     lines.append("")
-    lines.append("| runner | status | ingest eps | brief qps | handoff qps | brief citation coverage | handoff completeness |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("| runner | status | ingest eps | brief qps | handoff qps | brief ref coverage | brief span coverage | excerpt fidelity | handoff completeness | handoff span grounding |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for row in rows:
         lines.append(
-            "| {runner} | {status} | {ingest_eps:.2f} | {brief_qps:.2f} | {handoff_qps:.2f} | {bcc:.3f} | {hcr:.3f} |".format(
+            "| {runner} | {status} | {ingest_eps:.2f} | {brief_qps:.2f} | {handoff_qps:.2f} | {bcc:.3f} | {bsc:.3f} | {bef:.3f} | {hcr:.3f} | {hsg:.3f} |".format(
                 runner=str(row.get("runner", "")),
                 status=str(row.get("status", "")),
                 ingest_eps=float(row.get("ingest_eps", 0.0) or 0.0),
                 brief_qps=float(row.get("brief_qps", 0.0) or 0.0),
                 handoff_qps=float(row.get("handoff_qps", 0.0) or 0.0),
-                bcc=float(row.get("brief_claim_citation_coverage", 0.0) or 0.0),
+                bcc=float(row.get("brief_claim_ref_citation_coverage", row.get("brief_claim_citation_coverage", 0.0)) or 0.0),
+                bsc=float(row.get("brief_claim_span_citation_coverage", 0.0) or 0.0),
+                bef=float(row.get("brief_claim_excerpt_fidelity", 0.0) or 0.0),
                 hcr=float(row.get("handoff_completeness_rate", 0.0) or 0.0),
+                hsg=float(row.get("handoff_claim_span_grounding_rate", 0.0) or 0.0),
             )
         )
     lines.append("")
@@ -947,7 +1046,7 @@ def main() -> int:
         )
 
     payload: Dict[str, Any] = {
-        "benchmark": "apples_to_apples_v1",
+        "benchmark": "apples_to_apples_v2",
         "timestamp": run_ts,
         "params": {
             "events": int(args.events),

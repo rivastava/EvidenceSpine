@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/evidencespine_logo.png" alt="EvidenceSpine logo" width="320" />
+</p>
+
 # EvidenceSpine
 
 EvidenceSpine is an agent-agnostic conversation memory fabric for multi-agent workflows.
@@ -5,7 +9,7 @@ EvidenceSpine is an agent-agnostic conversation memory fabric for multi-agent wo
 It provides:
 - Evidence-bound event and fact memory (`asserted|verified|contradicted|superseded`)
 - Bounded context brief generation (no raw prompt stuffing)
-- Cross-agent handoff packets with checksum and citations
+- Cross-agent handoff packets with checksum, citations, and optional exact evidence spans
 - Fail-open behavior (memory failures do not block the caller)
 - Optional governance hooks for contradiction checks and external policy systems
 - Hybrid retrieval mode (`lexical|hybrid|vector`) with pluggable vector backend
@@ -14,6 +18,7 @@ It provides:
 ## Why this exists
 Most agent-memory systems store context. EvidenceSpine adds strict claim quality controls:
 - Every claim can carry citations
+- Claims can carry structured evidence items with exact line or character spans
 - Contradictions are explicit
 - Handoffs are structured and portable JSON
 
@@ -38,6 +43,7 @@ evidencespine ingest \
   --claim "Use additive patch set" \
   --fact-state verified \
   --evidence-ref "reports/decision_log.md" \
+  --evidence-item-json '{"source_id":"reports/decision_log.md","line_start":12,"line_end":14,"excerpt":"Use additive patch set","checksum":"sha256:3f8f41ad7f0d13005c2d2f5e732c69b5c7f7bd03ecf8d38df4ef0ae50930f550"}' \
   --json
 ```
 
@@ -73,6 +79,15 @@ export EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT=0.35
 
 By default hybrid uses an internal hashing vector backend (dependency-free).  
 You can inject your own backend by implementing `score_texts(query, texts) -> scores`.
+
+## Protocol v2 evidence spans
+
+EvidenceSpine `0.3.0` adds structured evidence spans without removing legacy refs:
+
+- `evidence_refs`: compatible string refs for existing integrations
+- `evidence_items`: structured spans with `source_id`, `locator`, line or char anchors, optional excerpt, checksum, confidence, and verification state
+- `citations`: structured brief claim citations with `primary_ref`, `evidence_refs`, `evidence_items`, and `span_grounded`
+- `citation_refs`: legacy brief alias for refs-only consumers
 
 ## Transcript-first integration
 

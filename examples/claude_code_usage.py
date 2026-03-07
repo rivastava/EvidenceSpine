@@ -1,4 +1,5 @@
 import shutil
+import hashlib
 from pathlib import Path
 
 from evidencespine.runtime import AgentMemoryRuntime
@@ -31,6 +32,8 @@ def main() -> None:
     settings = EvidenceSpineSettings.from_env(base_dir=str(base_dir))
     runtime = AgentMemoryRuntime(config=settings.to_runtime_config())
     thread_id = "claude_demo_bugfix"
+    decision_excerpt = "Patch retry path in request middleware"
+    risk_excerpt = "Timeout edge case still unverified for streaming requests."
 
     runtime.ingest_event(
         {
@@ -46,6 +49,15 @@ def main() -> None:
                 "next_actions": ["auditor should verify timeout edge cases"],
             },
             "evidence_refs": ["src/middleware/request_timeout.py:42"],
+            "evidence_items": [
+                {
+                    "source_id": "src/middleware/request_timeout.py",
+                    "line_start": 42,
+                    "line_end": 47,
+                    "excerpt": decision_excerpt,
+                    "checksum": f"sha256:{hashlib.sha256(decision_excerpt.encode('utf-8')).hexdigest()}",
+                }
+            ],
             "confidence": 0.87,
             "salience": 0.74,
         }
@@ -63,6 +75,15 @@ def main() -> None:
                 "fact_state": "asserted",
             },
             "evidence_refs": ["tests/test_request_timeout.py:88"],
+            "evidence_items": [
+                {
+                    "source_id": "tests/test_request_timeout.py",
+                    "line_start": 88,
+                    "line_end": 92,
+                    "excerpt": risk_excerpt,
+                    "checksum": f"sha256:{hashlib.sha256(risk_excerpt.encode('utf-8')).hexdigest()}",
+                }
+            ],
             "confidence": 0.68,
             "salience": 0.71,
         }

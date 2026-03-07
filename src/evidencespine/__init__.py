@@ -5,6 +5,8 @@ from evidencespine.protocol import (
     AgentHandoffPacket,
     AgentMemoryEvent,
     AgentMemoryFact,
+    ClaimCitation,
+    EvidenceItem,
 )
 from evidencespine.runtime import AgentMemoryRuntime, AgentMemoryRuntimeConfig, RuntimeHooks
 from evidencespine.settings import EvidenceSpineSettings
@@ -23,6 +25,8 @@ __all__ = [
     "AgentMemoryFact",
     "AgentConversationBrief",
     "AgentHandoffPacket",
+    "EvidenceItem",
+    "ClaimCitation",
     "AgentMemoryRuntime",
     "AgentMemoryRuntimeConfig",
     "RuntimeHooks",

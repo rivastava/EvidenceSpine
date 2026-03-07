@@ -24,12 +24,37 @@ runtime.ingest_event({
     "source_turn_id": "t-12",
     "payload": {"claim": "Use strategy B", "fact_state": "verified"},
     "evidence_refs": ["decision_log.md#L10"],
+    "evidence_items": [
+        {
+            "source_id": "decision_log.md",
+            "line_start": 10,
+            "line_end": 12,
+            "excerpt": "Use strategy B",
+        }
+    ],
     "confidence": 0.82,
     "salience": 0.66,
 })
 
 brief = runtime.build_brief("session_1", "what matters now")
 print(brief.to_dict())
+```
+
+`build_brief(...).to_dict()` now emits structured `citations` plus a legacy `citation_refs` alias.
+
+## 2a) Minimal CLI integration
+
+```bash
+evidencespine ingest \
+  --thread-id session_1 \
+  --event-type decision \
+  --source-agent-id agent_a \
+  --source-turn-id t-12 \
+  --claim "Use strategy B" \
+  --fact-state verified \
+  --evidence-ref "decision_log.md#L10" \
+  --evidence-item-json '{"source_id":"decision_log.md","line_start":10,"line_end":12,"excerpt":"Use strategy B"}' \
+  --json
 ```
 
 ## 3) Multi-agent handoff
@@ -86,7 +111,11 @@ adapter = TranscriptAdapter(rt, default_thread_id="thread_default")
 normalized = adapter.normalize_messages(
     [
         {"role": "user", "content": "Check drift"},
-        {"role": "assistant", "content": "Patch complete"},
+        {
+            "role": "assistant",
+            "content": "Patch complete",
+            "evidence_items": [{"source_id": "patch.diff", "line_start": 7, "line_end": 9}],
+        },
         {"role": "tool", "content": "pytest passed"},
     ]
 )
@@ -97,6 +126,7 @@ handoff = adapter.handoff("auditor", "verify latest claims")
 ```
 
 Use this when your runtime already exposes transcript-like `messages[]` and you want the smallest dependency-free integration surface.
+Caller-supplied `evidence_items` are preserved through normalization and ingestion; the adapter does not invent span data on its own.
 
 ## 7) Framework wrappers (drop-in convenience)
 

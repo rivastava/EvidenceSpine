@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Sequence, Tuple
 
-from evidencespine.protocol import AgentConversationBrief
+from evidencespine.protocol import (
+    AgentConversationBrief,
+    ClaimCitation,
+    has_grounded_span,
+    merge_evidence_refs,
+    normalize_evidence_items,
+)
 from evidencespine.vector_backends import VectorBackend
 
 
@@ -88,6 +94,14 @@ class AgentMemoryRetriever:
         age_h = max(0.0, (now_ts - _parse_ts(ts)) / 3600.0)
         return float(0.5 ** (age_h / half_life))
 
+    def _evidence_quality_score(self, row: Dict[str, Any]) -> float:
+        evidence_items = normalize_evidence_items(row.get("evidence_items"))
+        if has_grounded_span(evidence_items):
+            return 1.0
+        if len(merge_evidence_refs(row.get("evidence_refs"), evidence_items)) >= 1:
+            return 0.7
+        return 0.2
+
     def score_event(self, row: Dict[str, Any], query_tokens: Sequence[str], now_ts: float) -> float:
         payload = row.get("payload", {}) if isinstance(row.get("payload", {}), dict) else {}
         text = " ".join(
@@ -102,7 +116,7 @@ class AgentMemoryRetriever:
         rel = _jaccard(query_tokens, _tokenize(text))
         rec = self._recency_score(row.get("ts_utc", row.get("ts")), now_ts)
         sal = _safe_float(row.get("salience", payload.get("salience", 0.5)), 0.5, 0.0, 1.0)
-        evq = 1.0 if len(row.get("evidence_refs", []) or []) >= 1 else 0.2
+        evq = self._evidence_quality_score(row)
         return float(0.45 * rel + 0.25 * rec + 0.20 * sal + 0.10 * evq)
 
     def score_fact(self, row: Dict[str, Any], query_tokens: Sequence[str], now_ts: float) -> float:
@@ -110,7 +124,7 @@ class AgentMemoryRetriever:
         rel = _jaccard(query_tokens, _tokenize(claim))
         rec = self._recency_score(row.get("ts_utc", row.get("ts")), now_ts)
         conf = _safe_float(row.get("confidence", 0.5), 0.5, 0.0, 1.0)
-        evq = 1.0 if len(row.get("evidence_refs", []) or []) >= 1 else 0.2
+        evq = self._evidence_quality_score(row)
         return float(0.50 * rel + 0.20 * rec + 0.20 * conf + 0.10 * evq)
 
     def _event_text(self, row: Dict[str, Any]) -> str:
@@ -199,12 +213,24 @@ class AgentMemoryRetriever:
         top_facts = [dict(row) for _, row in scored_facts[: max(1, int(self.config.top_k_facts))]]
         return top_events, top_facts
 
-    def _claim_with_citation(self, claim: str, refs: Sequence[str], fallback_ref: str) -> Tuple[str, List[str]]:
+    def _claim_with_citation(
+        self,
+        claim: str,
+        refs: Sequence[str],
+        evidence_items: Sequence[Dict[str, Any]] | None,
+        fallback_ref: str,
+    ) -> Tuple[str, ClaimCitation]:
         clean_claim = _safe_text(claim, "", 2048)
-        citations = [_safe_text(x, "", 256) for x in list(refs or []) if _safe_text(x, "", 256)]
-        if not citations:
-            citations = [_safe_text(fallback_ref, "unknown_ref", 256)]
-        return f"{clean_claim} [ref:{citations[0]}]", citations
+        merged_refs = merge_evidence_refs(refs, evidence_items)
+        citation = ClaimCitation.from_value(
+            {
+                "primary_ref": (merged_refs[0] if merged_refs else _safe_text(fallback_ref, "unknown_ref", 256)),
+                "evidence_refs": merged_refs,
+                "evidence_items": list(evidence_items or []),
+            },
+            fallback_ref=_safe_text(fallback_ref, "unknown_ref", 256),
+        )
+        return f"{clean_claim} [ref:{citation.primary_ref}]", citation
 
     def build_brief(
         self,
@@ -225,7 +251,7 @@ class AgentMemoryRetriever:
         active_risks: List[str] = []
         open_items: List[str] = []
         next_actions: List[str] = []
-        citations: Dict[str, List[str]] = {}
+        citations: Dict[str, ClaimCitation] = {}
 
         for event in top_events:
             payload = event.get("payload", {}) if isinstance(event.get("payload", {}), dict) else {}
@@ -233,35 +259,57 @@ class AgentMemoryRetriever:
             if not current_goal:
                 goal = _safe_text(payload.get("current_goal", payload.get("goal", "")), "", 512)
                 if goal:
-                    line, refs = self._claim_with_citation(goal, event.get("evidence_refs", []), _safe_text(event.get("event_id"), "evt", 128))
+                    line, citation = self._claim_with_citation(
+                        goal,
+                        event.get("evidence_refs", []),
+                        event.get("evidence_items", []),
+                        _safe_text(event.get("event_id"), "evt", 128),
+                    )
                     current_goal.append(line)
-                    citations[line] = refs
+                    citations[line] = citation
             if et == "decision":
                 decision = _safe_text(payload.get("decision", payload.get("claim", "")), "", 512)
                 if decision:
-                    line, refs = self._claim_with_citation(decision, event.get("evidence_refs", []), _safe_text(event.get("event_id"), "evt", 128))
+                    line, citation = self._claim_with_citation(
+                        decision,
+                        event.get("evidence_refs", []),
+                        event.get("evidence_items", []),
+                        _safe_text(event.get("event_id"), "evt", 128),
+                    )
                     locked_decisions.append(line)
-                    citations[line] = refs
+                    citations[line] = citation
             if isinstance(payload.get("next_actions"), list):
                 for action in payload.get("next_actions", [])[:3]:
                     txt = _safe_text(action, "", 512)
                     if not txt:
                         continue
-                    line, refs = self._claim_with_citation(txt, event.get("evidence_refs", []), _safe_text(event.get("event_id"), "evt", 128))
+                    line, citation = self._claim_with_citation(
+                        txt,
+                        event.get("evidence_refs", []),
+                        event.get("evidence_items", []),
+                        _safe_text(event.get("event_id"), "evt", 128),
+                    )
                     next_actions.append(line)
-                    citations[line] = refs
+                    citations[line] = citation
 
         for fact in top_facts:
             claim = _safe_text(fact.get("claim"), "", 1024)
             if not claim:
                 continue
             state = _safe_text(fact.get("state"), "asserted", 32).lower()
-            line, refs = self._claim_with_citation(claim, fact.get("evidence_refs", []), _safe_text(fact.get("fact_id"), "fact", 128))
-            citations[line] = refs
+            line, citation = self._claim_with_citation(
+                claim,
+                fact.get("evidence_refs", []),
+                fact.get("evidence_items", []),
+                _safe_text(fact.get("fact_id"), "fact", 128),
+            )
+            citations[line] = citation
             if state == "verified":
                 recent_verified_facts.append(line)
             elif state == "contradicted":
-                active_risks.append(f"CONTRADICTION: {line}")
+                risk_line = f"CONTRADICTION: {line}"
+                active_risks.append(risk_line)
+                citations[risk_line] = citation
             elif state == "asserted":
                 open_items.append(line)
 
@@ -270,7 +318,15 @@ class AgentMemoryRetriever:
                 continue
             note = _safe_text(row.get("reason", row.get("query", "unresolved contradiction")), "unresolved contradiction", 512)
             if note:
-                active_risks.append(f"CONTRADICTION: {note}")
+                line, citation = self._claim_with_citation(
+                    note,
+                    row.get("evidence_refs", []),
+                    row.get("evidence_items", []),
+                    _safe_text(row.get("claim", "contradiction"), "contradiction", 128),
+                )
+                risk_line = f"CONTRADICTION: {line}"
+                active_risks.append(risk_line)
+                citations[risk_line] = citation
 
         ordered_sections = [
             ("current_goal", current_goal),

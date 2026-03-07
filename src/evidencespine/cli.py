@@ -13,6 +13,34 @@ def _build_runtime(base_dir: str | None) -> AgentMemoryRuntime:
     return AgentMemoryRuntime(config=settings.to_runtime_config())
 
 
+def _coerce_evidence_item_payload(raw: Any, *, source: str) -> list[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        return [dict(raw)]
+    if isinstance(raw, list):
+        out: list[Dict[str, Any]] = []
+        for idx, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(f"{source}[{idx}] must be a JSON object")
+            out.append(dict(item))
+        return out
+    raise ValueError(f"{source} must be a JSON object or array of objects")
+
+
+def _load_evidence_items(args: argparse.Namespace) -> list[Dict[str, Any]]:
+    items: list[Dict[str, Any]] = []
+    for idx, raw in enumerate(list(args.evidence_item_json or [])):
+        try:
+            parsed = json.loads(str(raw))
+        except Exception as exc:
+            raise ValueError(f"--evidence-item-json[{idx}] is not valid JSON: {exc}") from exc
+        items.extend(_coerce_evidence_item_payload(parsed, source=f"--evidence-item-json[{idx}]"))
+    for path in list(args.evidence_item_file or []):
+        with open(str(path), "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+        items.extend(_coerce_evidence_item_payload(parsed, source=str(path)))
+    return items
+
+
 def _cmd_ingest(args: argparse.Namespace) -> int:
     runtime = _build_runtime(args.base_dir)
     payload: Dict[str, Any] = {}
@@ -31,6 +59,14 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     next_actions = [str(x).strip() for x in list(args.next_action or []) if str(x).strip()]
     if next_actions:
         payload["next_actions"] = next_actions
+    try:
+        evidence_items = _load_evidence_items(args)
+    except ValueError as exc:
+        if bool(args.json):
+            print(json.dumps({"status": "invalid_input", "reason": str(exc)}, indent=2, ensure_ascii=True))
+        else:
+            print(str(exc))
+        return 2
 
     out = runtime.ingest_event(
         {
@@ -41,6 +77,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             "source_turn_id": str(args.source_turn_id),
             "payload": payload,
             "evidence_refs": [str(x).strip() for x in list(args.evidence_ref or []) if str(x).strip()],
+            "evidence_items": evidence_items,
             "confidence": float(args.confidence),
             "salience": float(args.salience),
         }
@@ -140,6 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--fact-state", default="", choices=["", "asserted", "verified", "contradicted", "superseded"])
     ingest.add_argument("--next-action", action="append", default=[])
     ingest.add_argument("--evidence-ref", action="append", default=[])
+    ingest.add_argument("--evidence-item-json", action="append", default=[])
+    ingest.add_argument("--evidence-item-file", action="append", default=[])
     ingest.add_argument("--confidence", type=float, default=0.6)
     ingest.add_argument("--salience", type=float, default=0.5)
     ingest.add_argument("--json", action="store_true")

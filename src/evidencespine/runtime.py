@@ -12,7 +12,12 @@ from evidencespine.protocol import (
     AgentHandoffPacket,
     AgentMemoryEvent,
     AgentMemoryFact,
+    ClaimCitation,
+    evidence_item_excerpt_matches_checksum,
     event_to_fact_candidates,
+    has_grounded_span,
+    merge_evidence_refs,
+    normalize_evidence_items,
     normalize_refs,
     safe_text,
     validate_event_dict,
@@ -50,6 +55,58 @@ class RuntimeHooks:
     on_brief: Optional[Callable[[Dict[str, Any]], None]] = None
     on_handoff: Optional[Callable[[Dict[str, Any]], None]] = None
     contradiction_pass: Optional[Callable[[str, List[Dict[str, Any]]], List[Dict[str, Any]]]] = None
+
+
+def _brief_sections(brief: AgentConversationBrief | Dict[str, Any]) -> List[List[str]]:
+    payload = brief.to_dict() if isinstance(brief, AgentConversationBrief) else dict(brief or {})
+    return [
+        payload.get("current_goal", []) if isinstance(payload.get("current_goal", []), list) else [],
+        payload.get("locked_decisions", []) if isinstance(payload.get("locked_decisions", []), list) else [],
+        payload.get("recent_verified_facts", []) if isinstance(payload.get("recent_verified_facts", []), list) else [],
+        payload.get("active_risks", []) if isinstance(payload.get("active_risks", []), list) else [],
+        payload.get("open_items", []) if isinstance(payload.get("open_items", []), list) else [],
+        payload.get("next_actions", []) if isinstance(payload.get("next_actions", []), list) else [],
+    ]
+
+
+def _claim_citation(citations: Dict[str, Any], claim: str) -> ClaimCitation:
+    return ClaimCitation.from_value((citations or {}).get(claim, []), fallback_ref=safe_text(claim, "claim", 256))
+
+
+def _excerpt_metrics(citation: ClaimCitation) -> tuple[int, int]:
+    primary_item = citation.primary_evidence_item()
+    if not primary_item:
+        return 0, 0
+    if not safe_text(primary_item.get("excerpt"), "", 4096):
+        return 0, 0
+    return 1, (1 if evidence_item_excerpt_matches_checksum(primary_item) else 0)
+
+
+def _dedupe_evidence_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in normalize_evidence_items(items):
+        key = json.dumps(item, sort_keys=True, ensure_ascii=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _flatten_handoff_evidence_items(packet: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = list(normalize_evidence_items(packet.get("evidence_items")))
+    for key in ("claims", "unresolved_contradictions"):
+        for row in packet.get(key, []) if isinstance(packet.get(key, []), list) else []:
+            if isinstance(row, dict):
+                items.extend(normalize_evidence_items(row.get("evidence_items")))
+    return _dedupe_evidence_items(items)
+
+
+def _handoff_row_span_grounded(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return bool(row.get("span_grounded")) or has_grounded_span(row.get("evidence_items"))
 
 
 class AgentMemoryRuntime:
@@ -136,6 +193,7 @@ class AgentMemoryRuntime:
                     ts_utc=safe_text((event or {}).get("ts_utc"), "", 64),
                     payload=dict((event or {}).get("payload", {}) or {}),
                     evidence_refs=normalize_refs((event or {}).get("evidence_refs")),
+                    evidence_items=normalize_evidence_items((event or {}).get("evidence_items")),
                     confidence=float((event or {}).get("confidence", 0.5)),
                     salience=float((event or {}).get("salience", 0.5)),
                     tags=list((event or {}).get("tags", []) or []),
@@ -157,6 +215,7 @@ class AgentMemoryRuntime:
                         source_agent_id=safe_text(fact.get("source_agent_id"), row.get("source_agent_id", "unknown"), 128),
                         source_turn_id=safe_text(fact.get("source_turn_id"), row.get("source_turn_id", ""), 128),
                         evidence_refs=normalize_refs(fact.get("evidence_refs")),
+                        evidence_items=normalize_evidence_items(fact.get("evidence_items")),
                         confidence=float(fact.get("confidence", row.get("confidence", 0.5))),
                         tags=list(fact.get("tags", []) or []),
                         metadata=dict(fact.get("metadata", {}) or {}),
@@ -223,26 +282,31 @@ class AgentMemoryRuntime:
             self.store.write_brief(thread_id, brief.to_dict())
 
             claim_total = 0
-            claim_covered = 0
-            for section in [
-                brief.current_goal,
-                brief.locked_decisions,
-                brief.recent_verified_facts,
-                brief.active_risks,
-                brief.open_items,
-                brief.next_actions,
-            ]:
+            ref_covered = 0
+            span_covered = 0
+            excerpt_total = 0
+            excerpt_covered = 0
+            for section in _brief_sections(brief):
                 for claim in section:
                     claim_total += 1
-                    refs = brief.citations.get(claim, []) if isinstance(brief.citations, dict) else []
-                    if isinstance(refs, list) and len(refs) > 0:
-                        claim_covered += 1
+                    citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
+                    if len(citation) > 0:
+                        ref_covered += 1
+                    if citation.span_grounded:
+                        span_covered += 1
+                    add_total, add_covered = _excerpt_metrics(citation)
+                    excerpt_total += add_total
+                    excerpt_covered += add_covered
             self.store.record_brief_stats(
                 attempt=False,
                 success=True,
                 stale=bool(stale),
-                citation_total=claim_total,
-                citation_covered=claim_covered,
+                citation_ref_total=claim_total,
+                citation_ref_covered=ref_covered,
+                citation_span_total=claim_total,
+                citation_span_covered=span_covered,
+                citation_excerpt_total=excerpt_total,
+                citation_excerpt_covered=excerpt_covered,
             )
 
             if callable(self.hooks.on_brief):
@@ -267,8 +331,12 @@ class AgentMemoryRuntime:
                     attempt=False,
                     success=True,
                     stale=True,
-                    citation_total=0,
-                    citation_covered=0,
+                    citation_ref_total=0,
+                    citation_ref_covered=0,
+                    citation_span_total=0,
+                    citation_span_covered=0,
+                    citation_excerpt_total=0,
+                    citation_excerpt_covered=0,
                 )
                 return fallback
             raise
@@ -277,20 +345,26 @@ class AgentMemoryRuntime:
         brief = self.build_brief(thread_id=thread_id, query=f"handoff for {role}")
         claims: List[Dict[str, Any]] = []
         for claim in list(brief.recent_verified_facts or [])[:24]:
+            citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
             claims.append(
                 {
                     "claim": claim,
-                    "evidence_refs": list((brief.citations or {}).get(claim, []) or []),
+                    "evidence_refs": list(citation),
+                    "evidence_items": list(citation.evidence_items),
+                    "span_grounded": bool(citation.span_grounded),
                     "status": "verified",
                 }
             )
         if len(claims) == 0:
             fallback_claims = list(brief.locked_decisions or []) + list(brief.open_items or [])
             for claim in fallback_claims[:24]:
+                citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
                 claims.append(
                     {
                         "claim": claim,
-                        "evidence_refs": list((brief.citations or {}).get(claim, []) or []),
+                        "evidence_refs": list(citation),
+                        "evidence_items": list(citation.evidence_items),
+                        "span_grounded": bool(citation.span_grounded),
                         "status": "asserted",
                     }
                 )
@@ -298,20 +372,27 @@ class AgentMemoryRuntime:
         for risk in list(brief.active_risks or [])[:24]:
             if "CONTRADICTION" not in str(risk):
                 continue
+            citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, str(risk))
             unresolved.append(
                 {
                     "claim": str(risk),
                     "reason": "unresolved_contradiction",
-                    "evidence_refs": list((brief.citations or {}).get(risk, []) or []),
+                    "evidence_refs": list(citation),
+                    "evidence_items": list(citation.evidence_items),
+                    "span_grounded": bool(citation.span_grounded),
                 }
             )
 
         evidence_refs: List[str] = []
+        evidence_items: List[Dict[str, Any]] = []
         for row in claims:
-            evidence_refs.extend(normalize_refs(row.get("evidence_refs")))
+            evidence_refs.extend(merge_evidence_refs(row.get("evidence_refs"), row.get("evidence_items")))
+            evidence_items.extend(normalize_evidence_items(row.get("evidence_items")))
         for row in unresolved:
-            evidence_refs.extend(normalize_refs(row.get("evidence_refs")))
+            evidence_refs.extend(merge_evidence_refs(row.get("evidence_refs"), row.get("evidence_items")))
+            evidence_items.extend(normalize_evidence_items(row.get("evidence_items")))
         evidence_refs = list(dict.fromkeys([x for x in evidence_refs if x]))
+        evidence_items = _dedupe_evidence_items(evidence_items)
         required_validations = list(brief.open_items or [])
         if len(required_validations) == 0:
             required_validations = [f"Validate scope: {safe_text(scope, 'cross-agent coordination', 256)}"]
@@ -333,12 +414,15 @@ class AgentMemoryRuntime:
             unresolved_contradictions=unresolved,
             required_validations=list(required_validations),
             evidence_refs=evidence_refs,
+            evidence_items=evidence_items,
             source_snapshot=snapshot,
             metadata={
                 "brief_token_budget": int(brief.token_budget),
                 "brief_token_used_estimate": int((brief.metadata or {}).get("token_used_estimate", 0)),
-                "citation_claim_total": int(max(0, int(self.store.state.get("citation_claim_total", 0)))),
-                "citation_claim_covered_total": int(max(0, int(self.store.state.get("citation_claim_covered_total", 0)))),
+                "citation_ref_claim_total": int(max(0, int(self.store.state.get("citation_ref_claim_total", 0)))),
+                "citation_ref_claim_covered_total": int(max(0, int(self.store.state.get("citation_ref_claim_covered_total", 0)))),
+                "citation_span_claim_total": int(max(0, int(self.store.state.get("citation_span_claim_total", 0)))),
+                "citation_span_claim_covered_total": int(max(0, int(self.store.state.get("citation_span_claim_covered_total", 0)))),
             },
         )
         payload = packet.to_dict()
@@ -360,6 +444,7 @@ class AgentMemoryRuntime:
                         "objective_id": f"agent_handoff::{safe_text(thread_id, 'thread', 64)}",
                     },
                     "evidence_refs": normalize_refs(payload.get("evidence_refs")),
+                    "evidence_items": normalize_evidence_items(payload.get("evidence_items")),
                     "confidence": 0.75,
                     "salience": 0.6,
                     "metadata": {"packet_id": payload.get("packet_id"), "file_path": path},
@@ -393,6 +478,7 @@ class AgentMemoryRuntime:
         thread_id = safe_text(packet.get("thread_id"), "", 128)
         packet_id = safe_text(packet.get("packet_id"), "", 128)
         scope = safe_text(packet.get("scope"), "", 1024)
+        evidence_items = _flatten_handoff_evidence_items(packet)
         out = self.ingest_event(
             {
                 "thread_id": thread_id,
@@ -407,7 +493,8 @@ class AgentMemoryRuntime:
                     "next_actions": list(packet.get("required_validations", []) or []),
                     "objective_id": f"agent_handoff::{safe_text(thread_id, 'thread', 64)}",
                 },
-                "evidence_refs": normalize_refs(packet.get("evidence_refs", [])),
+                "evidence_refs": merge_evidence_refs(packet.get("evidence_refs", []), evidence_items),
+                "evidence_items": evidence_items,
                 "confidence": 0.65,
                 "salience": 0.55,
                 "metadata": {"imported_packet_id": packet_id},
@@ -431,8 +518,12 @@ class AgentMemoryRuntime:
 
         brief_recent = 0
         brief_stale = 0
-        citation_claim_total = 0
-        citation_claim_covered = 0
+        citation_ref_total = 0
+        citation_ref_covered = 0
+        citation_span_total = 0
+        citation_span_covered = 0
+        citation_excerpt_total = 0
+        citation_excerpt_covered = 0
         for path in brief_files[-1024:]:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
@@ -445,24 +536,25 @@ class AgentMemoryRuntime:
                 if bool(meta.get("stale", False)):
                     brief_stale += 1
                 citations = row.get("citations", {}) if isinstance(row.get("citations", {}), dict) else {}
-                for section in [
-                    row.get("current_goal", []),
-                    row.get("locked_decisions", []),
-                    row.get("recent_verified_facts", []),
-                    row.get("active_risks", []),
-                    row.get("open_items", []),
-                    row.get("next_actions", []),
-                ]:
+                for section in _brief_sections(row):
                     for claim in section if isinstance(section, list) else []:
-                        citation_claim_total += 1
-                        refs = citations.get(claim, []) if isinstance(citations, dict) else []
-                        if isinstance(refs, list) and len(refs) > 0:
-                            citation_claim_covered += 1
+                        citation_ref_total += 1
+                        citation_span_total += 1
+                        citation = _claim_citation(citations, claim)
+                        if len(citation) > 0:
+                            citation_ref_covered += 1
+                        if citation.span_grounded:
+                            citation_span_covered += 1
+                        add_total, add_covered = _excerpt_metrics(citation)
+                        citation_excerpt_total += add_total
+                        citation_excerpt_covered += add_covered
             except Exception:
                 continue
 
         handoff_recent = 0
         handoff_complete = 0
+        handoff_span_total = 0
+        handoff_span_covered = 0
         for path in handoff_files[-1024:]:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
@@ -481,6 +573,12 @@ class AgentMemoryRuntime:
                 has_substance = bool(len(claims) > 0 or len(locked_decisions) > 0 or len(required_validations) > 0 or len(unresolved_rows) > 0)
                 if has_scope and has_role and has_thread and has_substance:
                     handoff_complete += 1
+                for row_item in claims + unresolved_rows:
+                    if not isinstance(row_item, dict):
+                        continue
+                    handoff_span_total += 1
+                    if _handoff_row_span_grounded(row_item):
+                        handoff_span_covered += 1
             except Exception:
                 continue
 
@@ -504,7 +602,11 @@ class AgentMemoryRuntime:
             "agent_brief_stale_rate_24h": (float(brief_stale / max(1, brief_recent)) if brief_recent > 0 else 0.0),
             "agent_handoff_packets_emitted_24h": int(handoff_recent),
             "agent_handoff_packet_completeness_24h": (float(handoff_complete / max(1, handoff_recent)) if handoff_recent > 0 else 0.0),
-            "agent_claim_citation_coverage_24h": (float(citation_claim_covered / max(1, citation_claim_total)) if citation_claim_total > 0 else 0.0),
+            "agent_claim_citation_coverage_24h": (float(citation_ref_covered / max(1, citation_ref_total)) if citation_ref_total > 0 else 0.0),
+            "agent_claim_ref_citation_coverage_24h": (float(citation_ref_covered / max(1, citation_ref_total)) if citation_ref_total > 0 else 0.0),
+            "agent_claim_span_citation_coverage_24h": (float(citation_span_covered / max(1, citation_span_total)) if citation_span_total > 0 else 0.0),
+            "agent_claim_excerpt_fidelity_24h": (float(citation_excerpt_covered / max(1, citation_excerpt_total)) if citation_excerpt_total > 0 else 0.0),
+            "agent_handoff_span_grounding_rate_24h": (float(handoff_span_covered / max(1, handoff_span_total)) if handoff_span_total > 0 else 0.0),
             "agent_memory_fail_open_events_24h": int(max(0, int(self.store.state.get("fail_open_events_total", 0)))),
             "agent_memory_last_update_ts": last_update_ts or None,
             "agent_memory_state_age_sec": (float(max(0.0, state_age)) if state_age is not None else None),

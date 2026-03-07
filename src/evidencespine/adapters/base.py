@@ -13,6 +13,8 @@ class NormalizedTranscriptMessage:
     evidence_ref: str
     confidence: float
     salience: float
+    evidence_refs: list[str] = field(default_factory=list)
+    evidence_items: list[Dict[str, Any]] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

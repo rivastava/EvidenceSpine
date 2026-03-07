@@ -70,11 +70,17 @@ class AgentMemoryStore:
         "fact_id",
         "packet_id",
         "checksum",
+        "source_id",
+        "locator",
         "thread_id",
         "source_turn_id",
         "event_type",
         "state",
         "role",
+        "line_start",
+        "line_end",
+        "char_start",
+        "char_end",
     }
     _REDACTION_PATTERNS = [
         re.compile(r"\b(sk|api|token|secret)[_-]?[a-z0-9]{8,}\b", re.IGNORECASE),
@@ -106,7 +112,7 @@ class AgentMemoryStore:
                 with open(path, "r", encoding="utf-8") as handle:
                     obj = json.load(handle)
                 if isinstance(obj, dict):
-                    obj.setdefault("schema_version", "v1")
+                    obj.setdefault("schema_version", "v2")
                     obj.setdefault("events_total", 0)
                     obj.setdefault("facts_total", 0)
                     obj.setdefault("dedupe_hits_total", 0)
@@ -118,13 +124,17 @@ class AgentMemoryStore:
                     obj.setdefault("brief_generation_success_total", 0)
                     obj.setdefault("brief_stale_total", 0)
                     obj.setdefault("handoff_packets_total", 0)
-                    obj.setdefault("citation_claim_total", 0)
-                    obj.setdefault("citation_claim_covered_total", 0)
+                    obj.setdefault("citation_ref_claim_total", 0)
+                    obj.setdefault("citation_ref_claim_covered_total", 0)
+                    obj.setdefault("citation_span_claim_total", 0)
+                    obj.setdefault("citation_span_claim_covered_total", 0)
+                    obj.setdefault("citation_excerpt_claim_total", 0)
+                    obj.setdefault("citation_excerpt_claim_covered_total", 0)
                     return obj
             except Exception:
                 pass
         return {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "events_total": 0,
             "facts_total": 0,
             "dedupe_hits_total": 0,
@@ -136,8 +146,12 @@ class AgentMemoryStore:
             "brief_generation_success_total": 0,
             "brief_stale_total": 0,
             "handoff_packets_total": 0,
-            "citation_claim_total": 0,
-            "citation_claim_covered_total": 0,
+            "citation_ref_claim_total": 0,
+            "citation_ref_claim_covered_total": 0,
+            "citation_span_claim_total": 0,
+            "citation_span_claim_covered_total": 0,
+            "citation_excerpt_claim_total": 0,
+            "citation_excerpt_claim_covered_total": 0,
         }
 
     def _save_state(self) -> None:
@@ -338,7 +352,19 @@ class AgentMemoryStore:
                 json.dump(self._redact_obj(dict(payload or {})), handle, indent=2, sort_keys=True, ensure_ascii=True)
             return path
 
-    def record_brief_stats(self, *, attempt: bool, success: bool, stale: bool, citation_total: int, citation_covered: int) -> None:
+    def record_brief_stats(
+        self,
+        *,
+        attempt: bool,
+        success: bool,
+        stale: bool,
+        citation_ref_total: int,
+        citation_ref_covered: int,
+        citation_span_total: int,
+        citation_span_covered: int,
+        citation_excerpt_total: int,
+        citation_excerpt_covered: int,
+    ) -> None:
         with self._lock:
             if bool(attempt):
                 self.state["brief_generation_attempts_total"] = int(max(0, int(self.state.get("brief_generation_attempts_total", 0)))) + 1
@@ -346,8 +372,12 @@ class AgentMemoryStore:
                 self.state["brief_generation_success_total"] = int(max(0, int(self.state.get("brief_generation_success_total", 0)))) + 1
             if bool(stale):
                 self.state["brief_stale_total"] = int(max(0, int(self.state.get("brief_stale_total", 0)))) + 1
-            self.state["citation_claim_total"] = int(max(0, int(self.state.get("citation_claim_total", 0)))) + int(max(0, int(citation_total)))
-            self.state["citation_claim_covered_total"] = int(max(0, int(self.state.get("citation_claim_covered_total", 0)))) + int(max(0, int(citation_covered)))
+            self.state["citation_ref_claim_total"] = int(max(0, int(self.state.get("citation_ref_claim_total", 0)))) + int(max(0, int(citation_ref_total)))
+            self.state["citation_ref_claim_covered_total"] = int(max(0, int(self.state.get("citation_ref_claim_covered_total", 0)))) + int(max(0, int(citation_ref_covered)))
+            self.state["citation_span_claim_total"] = int(max(0, int(self.state.get("citation_span_claim_total", 0)))) + int(max(0, int(citation_span_total)))
+            self.state["citation_span_claim_covered_total"] = int(max(0, int(self.state.get("citation_span_claim_covered_total", 0)))) + int(max(0, int(citation_span_covered)))
+            self.state["citation_excerpt_claim_total"] = int(max(0, int(self.state.get("citation_excerpt_claim_total", 0)))) + int(max(0, int(citation_excerpt_total)))
+            self.state["citation_excerpt_claim_covered_total"] = int(max(0, int(self.state.get("citation_excerpt_claim_covered_total", 0)))) + int(max(0, int(citation_excerpt_covered)))
             self._save_state()
 
     def record_handoff_packet(self) -> None:

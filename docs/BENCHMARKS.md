@@ -8,6 +8,10 @@ It measures:
 1. Ingest latency and throughput (`events/sec`, p50, p95)
 2. Brief latency and throughput (`queries/sec`, p50, p95)
 3. Handoff latency and throughput (`handoffs/sec`, p50, p95)
+4. Brief claim ref citation coverage
+5. Brief claim span citation coverage
+6. Brief excerpt fidelity
+7. Handoff claim span grounding rate
 
 Modes:
 - `lexical`
@@ -36,8 +40,13 @@ PYTHONPATH=src python benchmarks/bench_evidencespine.py \
 ## Interpretation notes
 
 1. `hybrid`/`vector` can be slower than `lexical` because they add vector scoring.
-2. Focus on p95 latency and throughput, not single-run p50 only.
-3. Run multiple seeds/hardware profiles before making product claims.
+2. Grounding metrics are meaningful only when benchmark events carry structured `evidence_items`.
+3. `brief_claim_ref_citation_coverage` measures whether claims point to any citation ref at all.
+4. `brief_claim_span_citation_coverage` measures whether claims point to at least one structured grounded span.
+5. `brief_claim_excerpt_fidelity` measures whether the primary evidence excerpt survives persistence and still matches its checksum.
+6. `handoff_claim_span_grounding_rate` measures whether handoff claim and contradiction rows retain structured grounded evidence.
+7. Focus on p95 latency and grounding quality together, not single-run p50 only.
+8. Run multiple seeds or hardware profiles before making product claims.
 
 See apples-to-apples guide:
 - `docs/APPLE_TO_APPLE_COMPARISON.md`

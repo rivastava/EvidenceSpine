@@ -12,10 +12,25 @@ Provide shared memory continuity across agent sessions without stuffing full log
 6. Portable handoff packets for agent-to-agent transfer
 7. Fail-open: memory subsystem failure does not block caller
 
+## Claim grounding
+
+Protocol v2 adds claim-to-span grounding without changing the storage engine:
+
+- `evidence_refs` remain the backward-compatible ref string layer.
+- `evidence_items` add exact line or character anchors, optional excerpts, checksums, and verification metadata.
+- Brief citations and handoff claim rows can now point to exact spans while still exposing compatible ref lists.
+
+Grounding quality is observable through snapshot metrics:
+- ref citation coverage
+- span-grounded citation coverage
+- excerpt fidelity
+- handoff span grounding rate
+
 ## Data flow
 `intent -> decision -> action -> outcome -> reflection`
 
 Each event can generate one or more fact candidates.
+Structured evidence items propagate from events into derived facts, then into briefs and handoffs.
 
 ## Adapter pipeline
 
@@ -52,3 +67,8 @@ Framework adapters provided:
 - Sensitive value redaction on persistence
 - Fallback brief/handoff behavior if operations fail
 - JSON artifacts are deterministic and auditable
+
+Protocol v2 keeps this model intact:
+- no storage migration
+- no runtime dependency additions
+- mixed refs-only and span-grounded artifacts remain readable
