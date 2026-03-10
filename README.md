@@ -159,22 +159,26 @@ Published benchmark snapshot:
 
 ## Release checklist
 - [x] Installable package (`pyproject.toml`)
-- [x] Source-available noncommercial license
+- [x] OSI-approved open-source license
 - [x] CLI and examples
 - [x] Replay-backed adapter examples
 - [x] Adapter normalization contract
 - [x] Documentation
 
 ## License
-This project is distributed under **PolyForm Noncommercial 1.0.0**.  
-Commercial use requires a separate license agreement.
+This project is distributed under the **Apache License 2.0**.
 
 See:
 - `LICENSE`
-- `COMMERCIAL_LICENSE.md`
+- `DCO`
 
-Commercial licensing contact:
-- `rivastava0@gmail.com`
+## Contributing
+Contributions are welcome. By submitting a contribution, you agree it is licensed under Apache-2.0 and certify origin via the Developer Certificate of Origin (`DCO`).
+Use `Signed-off-by` in commits, for example:
+
+```bash
+git commit -s -m "feat: improve adapter replay docs"
+```
 
 ## Positioning
 EvidenceSpine is not a general orchestration framework. It is a memory + handoff quality layer that can plug into existing stacks (LangGraph, AutoGen, CrewAI, custom runtimes).

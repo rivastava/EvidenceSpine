@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Relicensed EvidenceSpine from PolyForm Noncommercial to Apache-2.0.
+- Added contribution policy and DCO sign-off guidance for external contributors.
+- Removed commercial-license sidecar documentation from the package manifest.
+
 ## [0.3.0] - 2026-03-07
 
 ### Added
