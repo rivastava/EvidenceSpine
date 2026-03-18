@@ -32,15 +32,23 @@ runtime.ingest_event({
             "excerpt": "Use strategy B",
         }
     ],
+    "state_context": {
+        "scope_id": "strategy-b-rollout",
+        "state_kind": "agent_local_work",
+        "status": "active",
+        "owner_agent_id": "agent_a",
+    },
     "confidence": 0.82,
     "salience": 0.66,
 })
 
 brief = runtime.build_brief("session_1", "what matters now")
 print(brief.to_dict())
+print(runtime.query_view("active_scopes", thread_id="session_1").to_dict())
 ```
 
 `build_brief(...).to_dict()` now emits structured `citations` plus a legacy `citation_refs` alias.
+`query_view(...)` gives agents a compact current-state surface without tailing raw JSONL.
 
 ## 2a) Minimal CLI integration
 
@@ -52,9 +60,15 @@ evidencespine ingest \
   --source-turn-id t-12 \
   --claim "Use strategy B" \
   --fact-state verified \
+  --scope-id strategy-b-rollout \
+  --state-kind agent_local_work \
+  --status active \
+  --owner-agent-id agent_a \
   --evidence-ref "decision_log.md#L10" \
   --evidence-item-json '{"source_id":"decision_log.md","line_start":10,"line_end":12,"excerpt":"Use strategy B"}' \
   --json
+
+evidencespine view active-scopes --thread-id session_1 --json
 ```
 
 ## 3) Multi-agent handoff
@@ -63,6 +77,8 @@ evidencespine ingest \
 packet = runtime.emit_handoff(role="auditor", thread_id="session_1", scope="verify claims")
 runtime.import_handoff(packet.to_dict(), source_agent_id="auditor_agent")
 ```
+
+Handoff claim rows preserve `state_context` when the brief claim carried it, so ownership and gate freshness survive role changes.
 
 ## 4) Optional contradiction hook
 
@@ -75,6 +91,32 @@ def contradiction_pass(query, facts):
     return []
 
 runtime = AgentMemoryRuntime(hooks=RuntimeHooks(contradiction_pass=contradiction_pass))
+```
+
+Optional reconciliation hook:
+
+```python
+def reconcile_state(thread_id, active_scope_rows):
+    return [
+        {
+            "thread_id": thread_id,
+            "event_type": "reflection",
+            "source_agent_id": "runtime_probe",
+            "payload": {"claim": "release gate still blocked", "fact_state": "verified"},
+            "state_context": {
+                "scope_id": "release-gate",
+                "state_kind": "global_blocker",
+                "status": "blocked",
+                "state_basis": "runtime_validated",
+                "validated_at": "2026-03-18T09:30:00Z",
+                "validated_by": "smoke",
+                "fresh_until": "2026-03-18T10:30:00Z",
+            },
+        }
+    ]
+
+runtime = AgentMemoryRuntime(hooks=RuntimeHooks(reconcile_state=reconcile_state))
+runtime.reconcile("session_1")
 ```
 
 ## 5) Hybrid retrieval mode
@@ -126,7 +168,7 @@ handoff = adapter.handoff("auditor", "verify latest claims")
 ```
 
 Use this when your runtime already exposes transcript-like `messages[]` and you want the smallest dependency-free integration surface.
-Caller-supplied `evidence_items` are preserved through normalization and ingestion; the adapter does not invent span data on its own.
+Caller-supplied `evidence_items` and `state_context` are preserved through normalization and ingestion; the adapter does not invent span or control-state data on its own.
 
 ## 7) Framework wrappers (drop-in convenience)
 
@@ -161,7 +203,9 @@ PYTHONPATH=src python examples/langgraph_replay_demo.py
 ## 9) Operational checklist
 - Persist events with evidence refs.
 - Mark fact state correctly (asserted vs verified).
+- Use `state_context` for gates, blockers, ownership, and freshness when those semantics matter.
 - Generate brief before each major agent action.
+- Use `query_view("active_scopes")` or the CLI `view` command before role changes.
 - Emit handoff packet when switching role/agent.
 - Watch `snapshot()` metrics for stale or low citation coverage.
 

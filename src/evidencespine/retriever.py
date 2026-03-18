@@ -9,9 +9,11 @@ from typing import Any, Dict, List, Sequence, Tuple
 from evidencespine.protocol import (
     AgentConversationBrief,
     ClaimCitation,
+    freshness_state_for_context,
     has_grounded_span,
     merge_evidence_refs,
     normalize_evidence_items,
+    normalize_state_context,
 )
 from evidencespine.vector_backends import VectorBackend
 
@@ -219,6 +221,7 @@ class AgentMemoryRetriever:
         refs: Sequence[str],
         evidence_items: Sequence[Dict[str, Any]] | None,
         fallback_ref: str,
+        state_context: Dict[str, Any] | None,
     ) -> Tuple[str, ClaimCitation]:
         clean_claim = _safe_text(claim, "", 2048)
         merged_refs = merge_evidence_refs(refs, evidence_items)
@@ -227,6 +230,7 @@ class AgentMemoryRetriever:
                 "primary_ref": (merged_refs[0] if merged_refs else _safe_text(fallback_ref, "unknown_ref", 256)),
                 "evidence_refs": merged_refs,
                 "evidence_items": list(evidence_items or []),
+                "state_context": state_context,
             },
             fallback_ref=_safe_text(fallback_ref, "unknown_ref", 256),
         )
@@ -256,6 +260,7 @@ class AgentMemoryRetriever:
         for event in top_events:
             payload = event.get("payload", {}) if isinstance(event.get("payload", {}), dict) else {}
             et = _safe_text(event.get("event_type"), "", 64).lower()
+            state_context = normalize_state_context(event.get("state_context")) if "state_context" in event else None
             if not current_goal:
                 goal = _safe_text(payload.get("current_goal", payload.get("goal", "")), "", 512)
                 if goal:
@@ -264,6 +269,7 @@ class AgentMemoryRetriever:
                         event.get("evidence_refs", []),
                         event.get("evidence_items", []),
                         _safe_text(event.get("event_id"), "evt", 128),
+                        state_context,
                     )
                     current_goal.append(line)
                     citations[line] = citation
@@ -275,6 +281,7 @@ class AgentMemoryRetriever:
                         event.get("evidence_refs", []),
                         event.get("evidence_items", []),
                         _safe_text(event.get("event_id"), "evt", 128),
+                        state_context,
                     )
                     locked_decisions.append(line)
                     citations[line] = citation
@@ -288,6 +295,7 @@ class AgentMemoryRetriever:
                         event.get("evidence_refs", []),
                         event.get("evidence_items", []),
                         _safe_text(event.get("event_id"), "evt", 128),
+                        state_context,
                     )
                     next_actions.append(line)
                     citations[line] = citation
@@ -297,11 +305,13 @@ class AgentMemoryRetriever:
             if not claim:
                 continue
             state = _safe_text(fact.get("state"), "asserted", 32).lower()
+            state_context = normalize_state_context(fact.get("state_context")) if "state_context" in fact else None
             line, citation = self._claim_with_citation(
                 claim,
                 fact.get("evidence_refs", []),
                 fact.get("evidence_items", []),
                 _safe_text(fact.get("fact_id"), "fact", 128),
+                state_context,
             )
             citations[line] = citation
             if state == "verified":
@@ -318,11 +328,13 @@ class AgentMemoryRetriever:
                 continue
             note = _safe_text(row.get("reason", row.get("query", "unresolved contradiction")), "unresolved contradiction", 512)
             if note:
+                state_context = normalize_state_context(row.get("state_context")) if "state_context" in row else None
                 line, citation = self._claim_with_citation(
                     note,
                     row.get("evidence_refs", []),
                     row.get("evidence_items", []),
                     _safe_text(row.get("claim", "contradiction"), "contradiction", 128),
+                    state_context,
                 )
                 risk_line = f"CONTRADICTION: {line}"
                 active_risks.append(risk_line)
@@ -347,6 +359,24 @@ class AgentMemoryRetriever:
                 trimmed[name].append(row)
                 used += cost
 
+        included_rows = set(sum(trimmed.values(), []))
+        included_citations = {key: value for key, value in citations.items() if key in included_rows}
+
+        now_ts = float(time.time())
+        active_scope_ids: set[str] = set()
+        open_gate_scope_ids: set[str] = set()
+        stale_scope_ids: set[str] = set()
+        for citation in included_citations.values():
+            state_context = normalize_state_context(citation.state_context) if citation.state_context is not None else {}
+            scope_id = _safe_text(state_context.get("scope_id"), "", 256)
+            if not scope_id:
+                continue
+            active_scope_ids.add(scope_id)
+            if _safe_text(state_context.get("state_kind"), "", 64) == "pending_gate" and _safe_text(state_context.get("status"), "", 64) != "closed":
+                open_gate_scope_ids.add(scope_id)
+            if freshness_state_for_context(state_context, now_ts=now_ts) == "stale":
+                stale_scope_ids.add(scope_id)
+
         return AgentConversationBrief(
             thread_id=_safe_text(thread_id, "", 128),
             query=_safe_text(query, "", 1024),
@@ -357,11 +387,14 @@ class AgentMemoryRetriever:
             active_risks=trimmed["active_risks"],
             open_items=trimmed["open_items"],
             next_actions=trimmed["next_actions"],
-            citations={k: v for k, v in citations.items() if k in set(sum(trimmed.values(), []))},
+            citations=included_citations,
             metadata={
                 "token_budget": int(budget),
                 "token_used_estimate": int(used),
                 "top_events_used": int(len(top_events)),
                 "top_facts_used": int(len(top_facts)),
+                "active_scope_count": int(len(active_scope_ids)),
+                "open_gate_count": int(len(open_gate_scope_ids)),
+                "stale_scope_count": int(len(stale_scope_ids)),
             },
         )

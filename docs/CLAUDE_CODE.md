@@ -4,6 +4,8 @@ This guide shows how to use EvidenceSpine as a sidecar memory layer for Claude C
 
 The point is not to replace Claude. The point is to stop passing large raw chat histories between sessions or roles and instead pass a bounded, evidence-backed brief.
 
+It is still a side-car, not the final runtime authority. If you have live runtime signals, reconcile them into EvidenceSpine rather than pretending the memory layer is the organism itself.
+
 ## What to log
 
 Log only high-value events:
@@ -60,6 +62,12 @@ runtime.ingest_event(
             "next_actions": ["auditor should verify timeout edge cases"],
         },
         "evidence_refs": ["src/middleware/request_timeout.py:42"],
+        "state_context": {
+            "scope_id": "auth-timeout-fix",
+            "state_kind": "agent_local_work",
+            "status": "active",
+            "owner_agent_id": "implementer",
+        },
         "confidence": 0.87,
         "salience": 0.74,
     }
@@ -75,6 +83,7 @@ brief = runtime.build_brief(
 )
 
 print(brief.to_dict())
+print(runtime.query_view("active_scopes", thread_id="bugfix_auth_timeout").to_dict())
 ```
 
 Use that brief in the next Claude Code prompt instead of pasting a long raw thread.
@@ -99,6 +108,7 @@ adapter.ingest_messages(
 ```
 
 This is the recommended default when integrating from transcript-oriented tools because it keeps the transform explicit and replayable.
+Caller-provided `state_context` survives transcript normalization if you want to mark ownership, blockers, or pending gates from the calling workflow.
 
 ## Emit a handoff packet
 
@@ -168,6 +178,12 @@ Use stable fact states:
 3. `contradicted`
 4. `superseded`
 
+Use `state_context` for operational semantics:
+1. `agent_local_work`
+2. `global_blocker`
+3. `pending_gate`
+4. `runtime_validated_state`
+
 Use real evidence refs whenever possible:
 1. file paths with lines
 2. test names
@@ -201,5 +217,6 @@ See:
 1. Ingest only high-signal events.
 2. Mark `fact_state` correctly.
 3. Build the brief before major prompt transitions.
-4. Emit handoff packets when switching roles.
-5. Watch `snapshot()` for citation coverage and contradiction metrics.
+4. Check `query_view("active_scopes")` or `query_view("open_gates")` before role switches.
+5. Emit handoff packets when switching roles.
+6. Watch `snapshot()` for citation, freshness, and conflict metrics.

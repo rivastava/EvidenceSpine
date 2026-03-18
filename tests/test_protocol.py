@@ -4,8 +4,10 @@ from evidencespine.protocol import (
     AgentMemoryEvent,
     event_to_fact_candidates,
     normalize_evidence_items,
+    normalize_state_context,
     validate_event_dict,
     validate_evidence_item_dict,
+    validate_state_context_dict,
 )
 
 
@@ -113,3 +115,77 @@ def test_event_to_fact_candidates_extracts_claims_and_inherits_evidence_items() 
     assert len(facts) >= 1
     assert all(f["state"] == "verified" for f in facts)
     assert all(f["evidence_items"][0]["source_id"] == "file.py" for f in facts)
+
+
+def test_state_context_validation_accepts_reported_agent_work() -> None:
+    ok, errors = validate_state_context_dict(
+        {
+            "scope_id": "auth-timeout-fix",
+            "state_kind": "agent_local_work",
+            "status": "active",
+            "owner_agent_id": "implementer",
+        }
+    )
+    assert ok
+    assert errors == []
+
+
+def test_state_context_validation_rejects_missing_scope_id() -> None:
+    ok, errors = validate_state_context_dict(
+        {
+            "state_kind": "agent_local_work",
+            "status": "active",
+        }
+    )
+    assert not ok
+    assert "missing:scope_id" in errors
+
+
+def test_state_context_validation_rejects_runtime_validated_without_validation_fields() -> None:
+    ok, errors = validate_state_context_dict(
+        {
+            "scope_id": "runtime-health",
+            "state_kind": "runtime_validated_state",
+            "status": "active",
+        }
+    )
+    assert not ok
+    assert "missing:validated_at" in errors
+    assert "missing:validated_by" in errors
+
+
+def test_state_context_validation_requires_fresh_until_for_live_blocker_or_gate() -> None:
+    ok, errors = validate_state_context_dict(
+        {
+            "scope_id": "ci-gate",
+            "state_kind": "pending_gate",
+            "status": "ready",
+        }
+    )
+    assert not ok
+    assert "missing:fresh_until" in errors
+
+
+def test_state_context_validation_requires_supersedes_for_superseded_status() -> None:
+    ok, errors = validate_state_context_dict(
+        {
+            "scope_id": "scope-a",
+            "state_kind": "agent_local_work",
+            "status": "superseded",
+        }
+    )
+    assert not ok
+    assert "missing:supersedes" in errors
+
+
+def test_normalize_state_context_applies_defaults() -> None:
+    row = normalize_state_context(
+        {
+            "scope_id": "ci-gate",
+            "state_kind": "pending_gate",
+            "status": "active",
+            "fresh_until": "2026-03-18T13:30:00Z",
+        }
+    )
+    assert row["scope_kind"] == "gate"
+    assert row["state_basis"] == "reported"

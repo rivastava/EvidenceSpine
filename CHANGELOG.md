@@ -4,10 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-18
+
+### Added
+- Added agent-state `state_context` support across events, facts, brief citations, handoff rows, and transcript normalization.
+- Added derived control views for `active_scopes`, `my_work`, `open_gates`, `stale_claims`, and `contradictions`.
+- Added a generic `reconcile_state` runtime hook plus `AgentMemoryRuntime.reconcile(...)`.
+- Added CLI support for structured control-state ingest and new `view` / `reconcile` commands.
+- Added runtime, protocol, CLI, and adapter tests for freshness, ownership, conflicts, and active-scope derivation.
+
 ### Changed
-- Relicensed EvidenceSpine from PolyForm Noncommercial to Apache-2.0.
-- Added contribution policy and DCO sign-off guidance for external contributors.
-- Removed commercial-license sidecar documentation from the package manifest.
+- Extended Protocol v2 without changing `schema_version`, storage layout, or the dependency-free runtime.
+- Propagated control-state metadata through brief generation and handoff import/export.
+- Added snapshot metrics for active-scope count, open gates, owner coverage, freshness coverage, stale rate, and conflict rate.
+- Updated docs and examples to position EvidenceSpine explicitly as a side-car rather than the final runtime authority.
+
+### Notes
+- Existing refs-only and free-form callers remain supported.
+- No storage migration or framework-specific truth adapter was introduced.
 
 ## [0.3.0] - 2026-03-07
 

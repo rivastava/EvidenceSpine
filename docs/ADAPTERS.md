@@ -1,6 +1,6 @@
 # Adapters
 
-EvidenceSpine v0.3 exposes a generic transcript adapter and thin framework wrappers.
+EvidenceSpine v0.4 exposes a generic transcript adapter and thin framework wrappers.
 
 ## Recommended default: `TranscriptAdapter`
 
@@ -44,11 +44,12 @@ Normalization outputs `NormalizedTranscriptMessage` rows with:
 - `evidence_ref`
 - `evidence_refs`
 - `evidence_items`
+- `state_context`
 - `confidence`
 - `salience`
 - `metadata`
 
-Caller-supplied `evidence_items` on raw message dicts are preserved through normalization and ingestion. The adapters do not synthesize structured evidence spans by themselves.
+Caller-supplied `evidence_items` and `state_context` on raw message dicts are preserved through normalization and ingestion. The adapters do not synthesize structured evidence spans or control-state semantics by themselves.
 
 ## Wrapper adapters
 

@@ -101,3 +101,30 @@ def test_transcript_adapter_preserves_caller_evidence_items(tmp_path: Path) -> N
     events_path = tmp_path / ".es" / "events.jsonl"
     latest = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert latest["evidence_items"][0]["source_id"] == "src/file.py"
+
+
+def test_transcript_adapter_preserves_state_context_from_raw_messages(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    adapter = TranscriptAdapter(runtime, default_thread_id="demo")
+    rows = adapter.normalize_messages(
+        [
+            {
+                "id": "m1",
+                "role": "assistant",
+                "content": "Patch under verification",
+                "state_context": {
+                    "scope_id": "auth-timeout-fix",
+                    "state_kind": "agent_local_work",
+                    "status": "active",
+                    "owner_agent_id": "implementer",
+                },
+            }
+        ]
+    )
+    assert rows[0].state_context is not None
+    assert rows[0].state_context["scope_id"] == "auth-timeout-fix"
+
+    adapter.ingest_messages(rows)
+    events_path = tmp_path / ".es" / "events.jsonl"
+    latest = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert latest["state_context"]["owner_agent_id"] == "implementer"

@@ -81,6 +81,17 @@ class AgentMemoryStore:
         "line_end",
         "char_start",
         "char_end",
+        "scope_id",
+        "scope_kind",
+        "state_kind",
+        "status",
+        "owner_agent_id",
+        "state_basis",
+        "validated_at",
+        "validated_by",
+        "fresh_until",
+        "lease_expires_at",
+        "supersedes",
     }
     _REDACTION_PATTERNS = [
         re.compile(r"\b(sk|api|token|secret)[_-]?[a-z0-9]{8,}\b", re.IGNORECASE),

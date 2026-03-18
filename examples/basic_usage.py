@@ -30,6 +30,12 @@ def main() -> None:
                     "checksum": f"sha256:{hashlib.sha256(excerpt.encode('utf-8')).hexdigest()}",
                 }
             ],
+            "state_context": {
+                "scope_id": "patch-set-a",
+                "state_kind": "agent_local_work",
+                "status": "active",
+                "owner_agent_id": "implementer",
+            },
             "confidence": 0.9,
             "salience": 0.7,
         }
@@ -37,6 +43,7 @@ def main() -> None:
 
     brief = runtime.build_brief("demo", "current status and next actions")
     print(brief.to_dict())
+    print(runtime.query_view("active_scopes", thread_id="demo").to_dict())
 
 
 if __name__ == "__main__":

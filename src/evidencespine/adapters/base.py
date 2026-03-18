@@ -15,6 +15,7 @@ class NormalizedTranscriptMessage:
     salience: float
     evidence_refs: list[str] = field(default_factory=list)
     evidence_items: list[Dict[str, Any]] = field(default_factory=list)
+    state_context: Dict[str, Any] | None = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

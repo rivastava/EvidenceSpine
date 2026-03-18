@@ -41,6 +41,29 @@ def _load_evidence_items(args: argparse.Namespace) -> list[Dict[str, Any]]:
     return items
 
 
+def _build_state_context(args: argparse.Namespace) -> Dict[str, Any] | None:
+    payload: Dict[str, Any] = {}
+    mapping = {
+        "scope_id": "scope_id",
+        "scope_kind": "scope_kind",
+        "state_kind": "state_kind",
+        "status": "status",
+        "owner_agent_id": "owner_agent_id",
+        "state_basis": "state_basis",
+        "validated_at": "validated_at",
+        "validated_by": "validated_by",
+        "fresh_until": "fresh_until",
+        "lease_expires_at": "lease_expires_at",
+        "supersedes": "supersedes",
+    }
+    for arg_name, key in mapping.items():
+        value = getattr(args, arg_name, "")
+        text = str(value).strip()
+        if text:
+            payload[key] = text
+    return (payload or None)
+
+
 def _cmd_ingest(args: argparse.Namespace) -> int:
     runtime = _build_runtime(args.base_dir)
     payload: Dict[str, Any] = {}
@@ -78,6 +101,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             "payload": payload,
             "evidence_refs": [str(x).strip() for x in list(args.evidence_ref or []) if str(x).strip()],
             "evidence_items": evidence_items,
+            "state_context": _build_state_context(args),
             "confidence": float(args.confidence),
             "salience": float(args.salience),
         }
@@ -158,6 +182,53 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_view(payload: Dict[str, Any]) -> None:
+    print("scope_id\tstate_kind\tstatus\towner\tfreshness\tconflict\tclaim")
+    for row in payload.get("rows", []) if isinstance(payload.get("rows", []), list) else []:
+        if not isinstance(row, dict):
+            continue
+        print(
+            "\t".join(
+                [
+                    str(row.get("scope_id", "")),
+                    str(row.get("state_kind", "")),
+                    str(row.get("status", "")),
+                    str(row.get("owner_agent_id", "")),
+                    str(row.get("freshness_state", "")),
+                    str(bool(row.get("conflict", False))).lower(),
+                    str(row.get("claim", "")),
+                ]
+            )
+        )
+
+
+def _cmd_view(args: argparse.Namespace) -> int:
+    runtime = _build_runtime(args.base_dir)
+    payload = runtime.query_view(
+        str(args.view_name).replace("-", "_"),
+        thread_id=str(args.thread_id or ""),
+        owner_agent_id=str(args.owner_agent_id or ""),
+        include_closed=bool(args.include_closed),
+        limit=int(args.limit),
+    ).to_dict()
+    if bool(args.json):
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
+    else:
+        _print_view(payload)
+    return 0
+
+
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    runtime = _build_runtime(args.base_dir)
+    payload = runtime.reconcile(thread_id=str(args.thread_id), limit=int(args.limit))
+    if bool(args.json):
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
+    else:
+        for key in sorted(payload.keys()):
+            print(f"{key}={payload[key]}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="EvidenceSpine CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -179,6 +250,21 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--evidence-ref", action="append", default=[])
     ingest.add_argument("--evidence-item-json", action="append", default=[])
     ingest.add_argument("--evidence-item-file", action="append", default=[])
+    ingest.add_argument("--scope-id", default="")
+    ingest.add_argument("--scope-kind", default="", choices=["", "task", "gate", "blocker", "runtime_state", "thread"])
+    ingest.add_argument(
+        "--state-kind",
+        default="",
+        choices=["", "agent_local_work", "global_blocker", "pending_gate", "runtime_validated_state"],
+    )
+    ingest.add_argument("--status", default="", choices=["", "active", "blocked", "ready", "closed", "superseded"])
+    ingest.add_argument("--owner-agent-id", default="")
+    ingest.add_argument("--state-basis", default="", choices=["", "reported", "runtime_validated", "derived", "imported"])
+    ingest.add_argument("--validated-at", default="")
+    ingest.add_argument("--validated-by", default="")
+    ingest.add_argument("--fresh-until", default="")
+    ingest.add_argument("--lease-expires-at", default="")
+    ingest.add_argument("--supersedes", default="")
     ingest.add_argument("--confidence", type=float, default=0.6)
     ingest.add_argument("--salience", type=float, default=0.5)
     ingest.add_argument("--json", action="store_true")
@@ -206,6 +292,26 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--base-dir", default=None)
     snapshot.add_argument("--json", action="store_true")
     snapshot.set_defaults(func=_cmd_snapshot)
+
+    view = sub.add_parser("view", help="Show derived agent-state control views")
+    view.add_argument(
+        "view_name",
+        choices=["active-scopes", "my-work", "open-gates", "stale-claims", "contradictions"],
+    )
+    view.add_argument("--base-dir", default=None)
+    view.add_argument("--thread-id", default="")
+    view.add_argument("--owner-agent-id", default="")
+    view.add_argument("--include-closed", action="store_true")
+    view.add_argument("--limit", type=int, default=50)
+    view.add_argument("--json", action="store_true")
+    view.set_defaults(func=_cmd_view)
+
+    reconcile = sub.add_parser("reconcile", help="Run optional state reconciliation hook")
+    reconcile.add_argument("--base-dir", default=None)
+    reconcile.add_argument("--thread-id", required=True)
+    reconcile.add_argument("--limit", type=int, default=50)
+    reconcile.add_argument("--json", action="store_true")
+    reconcile.set_defaults(func=_cmd_reconcile)
 
     return parser
 

@@ -4,22 +4,29 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from evidencespine.protocol import (
+    AgentControlView,
     AgentConversationBrief,
     AgentHandoffPacket,
     AgentMemoryEvent,
     AgentMemoryFact,
     ClaimCitation,
+    ControlViewRow,
+    control_row_sort_ts,
     evidence_item_excerpt_matches_checksum,
     event_to_fact_candidates,
+    freshness_state_for_context,
     has_grounded_span,
+    lease_state_for_context,
     merge_evidence_refs,
     normalize_evidence_items,
     normalize_refs,
+    normalize_state_context,
+    parse_ts_value,
     safe_text,
+    utc_now_iso,
     validate_event_dict,
     validate_handoff_dict,
 )
@@ -47,6 +54,7 @@ class AgentMemoryRuntimeConfig:
     retrieval_mode: str = "lexical"  # lexical | hybrid | vector
     retrieval_lexical_weight: float = 1.0
     retrieval_vector_weight: float = 0.35
+    control_view_lookback_hours: float = 168.0
 
 
 @dataclass
@@ -55,6 +63,7 @@ class RuntimeHooks:
     on_brief: Optional[Callable[[Dict[str, Any]], None]] = None
     on_handoff: Optional[Callable[[Dict[str, Any]], None]] = None
     contradiction_pass: Optional[Callable[[str, List[Dict[str, Any]]], List[Dict[str, Any]]]] = None
+    reconcile_state: Optional[Callable[[str, List[Dict[str, Any]]], List[Dict[str, Any]]]] = None
 
 
 def _brief_sections(brief: AgentConversationBrief | Dict[str, Any]) -> List[List[str]]:
@@ -109,6 +118,50 @@ def _handoff_row_span_grounded(row: Dict[str, Any]) -> bool:
     return bool(row.get("span_grounded")) or has_grounded_span(row.get("evidence_items"))
 
 
+def _source_priority(source_record_type: str) -> int:
+    return 1 if safe_text(source_record_type, "", 16) == "fact" else 0
+
+
+def _derive_claim_from_row(row: Dict[str, Any], source_record_type: str) -> str:
+    if source_record_type == "fact":
+        return safe_text(row.get("claim"), "", 2048)
+    payload = row.get("payload", {}) if isinstance(row.get("payload", {}), dict) else {}
+    for key in ("claim", "decision", "outcome", "target"):
+        text = safe_text(payload.get(key), "", 2048)
+        if text:
+            return text
+    if isinstance(payload.get("claims"), list) and payload.get("claims"):
+        return safe_text(payload["claims"][0], "", 2048)
+    return ""
+
+
+def _is_live_status(status: str) -> bool:
+    return safe_text(status, "", 32) not in {"closed", "superseded"}
+
+
+def _control_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_state_kind: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    seen_scope_ids: set[str] = set()
+    for row in rows:
+        state_context = normalize_state_context(row.get("state_context")) if isinstance(row, dict) and "state_context" in row else {}
+        scope_id = safe_text(row.get("scope_id", state_context.get("scope_id")), "", 256)
+        if not scope_id or scope_id in seen_scope_ids:
+            continue
+        seen_scope_ids.add(scope_id)
+        state_kind = safe_text(row.get("state_kind", state_context.get("state_kind")), "", 64)
+        status = safe_text(row.get("status", state_context.get("status")), "", 64)
+        if state_kind:
+            by_state_kind[state_kind] = by_state_kind.get(state_kind, 0) + 1
+        if status:
+            by_status[status] = by_status.get(status, 0) + 1
+    return {
+        "active_scope_count": int(len(seen_scope_ids)),
+        "by_state_kind": by_state_kind,
+        "by_status": by_status,
+    }
+
+
 class AgentMemoryRuntime:
     def __init__(
         self,
@@ -160,7 +213,7 @@ class AgentMemoryRuntime:
         self.store.state["last_fail_open"] = {
             "scope": safe_text(scope, "unknown", 128),
             "reason": safe_text(reason, "", 512),
-            "ts": datetime.utcnow().isoformat() + "Z",
+            "ts": utc_now_iso(),
         }
         self.store.flush()
 
@@ -176,6 +229,136 @@ class AgentMemoryRuntime:
         except Exception:
             return []
 
+    def _lookback_hours(self, value: float | None) -> float:
+        if value is not None:
+            return max(1.0, float(value))
+        return max(1.0, float(self.config.control_view_lookback_hours))
+
+    def _control_candidate(self, row: Dict[str, Any], source_record_type: str, now_ts: float) -> Dict[str, Any] | None:
+        if not isinstance(row, dict) or "state_context" not in row:
+            return None
+        state_context = normalize_state_context(row.get("state_context"))
+        if not state_context:
+            return None
+        scope_id = safe_text(state_context.get("scope_id"), "", 256)
+        if not scope_id:
+            return None
+        reported_at = safe_text(row.get("ts_utc", row.get("generated_at", "")), "", 64)
+        source_record_id = safe_text(row.get("fact_id" if source_record_type == "fact" else "event_id"), "", 128)
+        candidate_row = ControlViewRow(
+            scope_id=scope_id,
+            thread_id=safe_text(row.get("thread_id"), "", 128),
+            scope_kind=safe_text(state_context.get("scope_kind"), "", 64),
+            state_kind=safe_text(state_context.get("state_kind"), "", 64),
+            status=safe_text(state_context.get("status"), "", 64),
+            owner_agent_id=safe_text(state_context.get("owner_agent_id"), "", 128),
+            state_basis=safe_text(state_context.get("state_basis"), "", 64),
+            claim=_derive_claim_from_row(row, source_record_type),
+            source_record_id=source_record_id,
+            source_record_type=source_record_type,
+            reported_at=reported_at,
+            validated_at=safe_text(state_context.get("validated_at"), "", 64),
+            fresh_until=safe_text(state_context.get("fresh_until"), "", 64),
+            freshness_state=freshness_state_for_context(state_context, now_ts=now_ts),
+            lease_expires_at=safe_text(state_context.get("lease_expires_at"), "", 64),
+            lease_state=lease_state_for_context(state_context, now_ts=now_ts),
+            evidence_refs=merge_evidence_refs(row.get("evidence_refs"), row.get("evidence_items")),
+            evidence_items=normalize_evidence_items(row.get("evidence_items")),
+            metadata=dict(row.get("metadata", {}) or {}),
+        )
+        return {
+            "row": candidate_row,
+            "sort_ts": control_row_sort_ts(candidate_row),
+            "source_priority": _source_priority(source_record_type),
+            "supersedes_ref": safe_text(state_context.get("supersedes"), safe_text(row.get("supersedes_fact_id"), "", 128), 128),
+            "fact_state": safe_text(row.get("state"), "", 32).lower() if source_record_type == "fact" else "",
+        }
+
+    def _collect_control_candidates(self, *, thread_id: str = "", lookback_hours: float | None = None) -> List[Dict[str, Any]]:
+        now_ts = float(time.time())
+        window = self._lookback_hours(lookback_hours)
+        events = self.store.list_recent_events(
+            thread_id=thread_id,
+            max_items=max(256, int(self.config.max_event_tail)),
+            lookback_hours=window,
+        )
+        facts = self.store.list_recent_facts(
+            thread_id=thread_id,
+            max_items=max(256, int(self.config.max_event_tail)),
+            lookback_hours=window,
+        )
+        candidates: List[Dict[str, Any]] = []
+        for event in events:
+            candidate = self._control_candidate(event, "event", now_ts)
+            if candidate is not None:
+                candidates.append(candidate)
+        for fact in facts:
+            candidate = self._control_candidate(fact, "fact", now_ts)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def _resolved_control_rows(self, *, thread_id: str = "", include_closed: bool = False, lookback_hours: float | None = None) -> List[ControlViewRow]:
+        candidates = self._collect_control_candidates(thread_id=thread_id, lookback_hours=lookback_hours)
+        if not candidates:
+            return []
+        superseded_ids = {safe_text(item.get("supersedes_ref"), "", 128) for item in candidates if safe_text(item.get("supersedes_ref"), "", 128)}
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for item in candidates:
+            row = item["row"]
+            grouped.setdefault(row.scope_id, []).append(item)
+
+        resolved: List[ControlViewRow] = []
+        for scope_id, rows in grouped.items():
+            del scope_id
+            active_rows = [item for item in rows if item["row"].source_record_id not in superseded_ids]
+            if not active_rows:
+                active_rows = list(rows)
+            active_rows.sort(key=lambda item: (float(item["sort_ts"]), int(item["source_priority"]), safe_text(item["row"].source_record_id, "", 128)))
+            head = active_rows[-1]
+            live_rows = [item for item in active_rows if _is_live_status(item["row"].status)]
+
+            conflict = False
+            if len(live_rows) > 1:
+                statuses = {item["row"].status for item in live_rows}
+                owners = {item["row"].owner_agent_id for item in live_rows}
+                bases = {item["row"].state_basis for item in live_rows}
+                conflict = bool(len(statuses) > 1 or len(owners) > 1 or len(bases) > 1)
+
+            has_contradiction = any(item.get("fact_state") == "contradicted" for item in active_rows)
+            head_row = head["row"]
+            row = ControlViewRow(
+                scope_id=head_row.scope_id,
+                thread_id=head_row.thread_id,
+                scope_kind=head_row.scope_kind,
+                state_kind=head_row.state_kind,
+                status=head_row.status,
+                owner_agent_id=head_row.owner_agent_id,
+                state_basis=head_row.state_basis,
+                claim=head_row.claim,
+                source_record_id=head_row.source_record_id,
+                source_record_type=head_row.source_record_type,
+                reported_at=head_row.reported_at,
+                validated_at=head_row.validated_at,
+                fresh_until=head_row.fresh_until,
+                freshness_state=head_row.freshness_state,
+                lease_expires_at=head_row.lease_expires_at,
+                lease_state=head_row.lease_state,
+                has_contradiction=has_contradiction,
+                conflict=conflict,
+                evidence_refs=list(head_row.evidence_refs),
+                evidence_items=list(head_row.evidence_items),
+                metadata={
+                    **dict(head_row.metadata or {}),
+                    "supporting_record_count": int(len(active_rows)),
+                    "live_record_count": int(len(live_rows)),
+                },
+            )
+            if include_closed or _is_live_status(row.status):
+                resolved.append(row)
+        resolved.sort(key=lambda row: (control_row_sort_ts(row), _source_priority(row.source_record_type), safe_text(row.source_record_id, "", 128)), reverse=True)
+        return resolved
+
     def ingest_event(self, event: AgentMemoryEvent | Dict[str, Any]) -> Dict[str, Any]:
         if not bool(self.config.enabled):
             return {"status": "disabled", "reason": "agent_memory_disabled"}
@@ -183,21 +366,24 @@ class AgentMemoryRuntime:
             if isinstance(event, AgentMemoryEvent):
                 row = event.to_dict()
             else:
+                payload = dict(event or {})
+                state_context = payload.get("state_context") if "state_context" in payload else None
                 row = AgentMemoryEvent(
-                    event_id=safe_text((event or {}).get("event_id"), "", 128),
-                    thread_id=safe_text((event or {}).get("thread_id"), "", 128),
-                    event_type=safe_text((event or {}).get("event_type"), "reflection", 64),
-                    role=safe_text((event or {}).get("role"), "unknown", 64),
-                    source_agent_id=safe_text((event or {}).get("source_agent_id"), "unknown", 128),
-                    source_turn_id=safe_text((event or {}).get("source_turn_id"), "", 128),
-                    ts_utc=safe_text((event or {}).get("ts_utc"), "", 64),
-                    payload=dict((event or {}).get("payload", {}) or {}),
-                    evidence_refs=normalize_refs((event or {}).get("evidence_refs")),
-                    evidence_items=normalize_evidence_items((event or {}).get("evidence_items")),
-                    confidence=float((event or {}).get("confidence", 0.5)),
-                    salience=float((event or {}).get("salience", 0.5)),
-                    tags=list((event or {}).get("tags", []) or []),
-                    metadata=dict((event or {}).get("metadata", {}) or {}),
+                    event_id=safe_text(payload.get("event_id"), "", 128),
+                    thread_id=safe_text(payload.get("thread_id"), "", 128),
+                    event_type=safe_text(payload.get("event_type"), "reflection", 64),
+                    role=safe_text(payload.get("role"), "unknown", 64),
+                    source_agent_id=safe_text(payload.get("source_agent_id"), "unknown", 128),
+                    source_turn_id=safe_text(payload.get("source_turn_id"), "", 128),
+                    ts_utc=safe_text(payload.get("ts_utc"), "", 64),
+                    payload=dict(payload.get("payload", {}) or {}),
+                    evidence_refs=normalize_refs(payload.get("evidence_refs")),
+                    evidence_items=normalize_evidence_items(payload.get("evidence_items")),
+                    state_context=state_context,
+                    confidence=float(payload.get("confidence", 0.5)),
+                    salience=float(payload.get("salience", 0.5)),
+                    tags=list(payload.get("tags", []) or []),
+                    metadata=dict(payload.get("metadata", {}) or {}),
                 ).to_dict()
 
             valid, errors = validate_event_dict(row)
@@ -216,8 +402,10 @@ class AgentMemoryRuntime:
                         source_turn_id=safe_text(fact.get("source_turn_id"), row.get("source_turn_id", ""), 128),
                         evidence_refs=normalize_refs(fact.get("evidence_refs")),
                         evidence_items=normalize_evidence_items(fact.get("evidence_items")),
+                        state_context=(fact.get("state_context") if "state_context" in fact else None),
                         confidence=float(fact.get("confidence", row.get("confidence", 0.5))),
                         tags=list(fact.get("tags", []) or []),
+                        supersedes_fact_id=safe_text(fact.get("supersedes_fact_id"), "", 128),
                         metadata=dict(fact.get("metadata", {}) or {}),
                     ).to_dict()
                     self.store.append_fact(f)
@@ -264,17 +452,7 @@ class AgentMemoryRuntime:
             now_ts = float(time.time())
             latest_ts = 0.0
             for row in events:
-                v = row.get("ts")
-                if v is None:
-                    v = row.get("ts_utc")
-                try:
-                    ts = float(v)
-                except Exception:
-                    try:
-                        ts = datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
-                    except Exception:
-                        ts = 0.0
-                latest_ts = max(latest_ts, ts)
+                latest_ts = max(latest_ts, parse_ts_value(row.get("ts")) or parse_ts_value(row.get("ts_utc")) or 0.0)
             if latest_ts > 0.0:
                 stale = bool((now_ts - latest_ts) > float(max(300.0, self.config.dedupe_window_sec)))
             brief.metadata["stale"] = bool(stale)
@@ -326,6 +504,9 @@ class AgentMemoryRuntime:
                 )
                 fallback.metadata["fail_open_reason"] = safe_text(str(exc), "", 512)
                 fallback.metadata["stale"] = True
+                fallback.metadata["active_scope_count"] = 0
+                fallback.metadata["open_gate_count"] = 0
+                fallback.metadata["stale_scope_count"] = 0
                 self.store.write_brief(thread_id, fallback.to_dict())
                 self.store.record_brief_stats(
                     attempt=False,
@@ -346,42 +527,45 @@ class AgentMemoryRuntime:
         claims: List[Dict[str, Any]] = []
         for claim in list(brief.recent_verified_facts or [])[:24]:
             citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
-            claims.append(
-                {
-                    "claim": claim,
-                    "evidence_refs": list(citation),
-                    "evidence_items": list(citation.evidence_items),
-                    "span_grounded": bool(citation.span_grounded),
-                    "status": "verified",
-                }
-            )
+            row: Dict[str, Any] = {
+                "claim": claim,
+                "evidence_refs": list(citation),
+                "evidence_items": list(citation.evidence_items),
+                "span_grounded": bool(citation.span_grounded),
+                "status": "verified",
+            }
+            if citation.state_context is not None:
+                row["state_context"] = normalize_state_context(citation.state_context)
+            claims.append(row)
         if len(claims) == 0:
             fallback_claims = list(brief.locked_decisions or []) + list(brief.open_items or [])
             for claim in fallback_claims[:24]:
                 citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
-                claims.append(
-                    {
-                        "claim": claim,
-                        "evidence_refs": list(citation),
-                        "evidence_items": list(citation.evidence_items),
-                        "span_grounded": bool(citation.span_grounded),
-                        "status": "asserted",
-                    }
-                )
+                row = {
+                    "claim": claim,
+                    "evidence_refs": list(citation),
+                    "evidence_items": list(citation.evidence_items),
+                    "span_grounded": bool(citation.span_grounded),
+                    "status": "asserted",
+                }
+                if citation.state_context is not None:
+                    row["state_context"] = normalize_state_context(citation.state_context)
+                claims.append(row)
         unresolved: List[Dict[str, Any]] = []
         for risk in list(brief.active_risks or [])[:24]:
             if "CONTRADICTION" not in str(risk):
                 continue
             citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, str(risk))
-            unresolved.append(
-                {
-                    "claim": str(risk),
-                    "reason": "unresolved_contradiction",
-                    "evidence_refs": list(citation),
-                    "evidence_items": list(citation.evidence_items),
-                    "span_grounded": bool(citation.span_grounded),
-                }
-            )
+            row = {
+                "claim": str(risk),
+                "reason": "unresolved_contradiction",
+                "evidence_refs": list(citation),
+                "evidence_items": list(citation.evidence_items),
+                "span_grounded": bool(citation.span_grounded),
+            }
+            if citation.state_context is not None:
+                row["state_context"] = normalize_state_context(citation.state_context)
+            unresolved.append(row)
 
         evidence_refs: List[str] = []
         evidence_items: List[Dict[str, Any]] = []
@@ -403,6 +587,7 @@ class AgentMemoryRuntime:
             "brief_generated_at": safe_text(brief.generated_at, "", 64),
             "last_update_ts": safe_text(self.store.state.get("last_update_ts"), "", 64),
         }
+        active_scope_rows = [row for row in claims + unresolved if normalize_state_context(row.get("state_context"))]
 
         packet = AgentHandoffPacket(
             packet_id="",
@@ -423,6 +608,7 @@ class AgentMemoryRuntime:
                 "citation_ref_claim_covered_total": int(max(0, int(self.store.state.get("citation_ref_claim_covered_total", 0)))),
                 "citation_span_claim_total": int(max(0, int(self.store.state.get("citation_span_claim_total", 0)))),
                 "citation_span_claim_covered_total": int(max(0, int(self.store.state.get("citation_span_claim_covered_total", 0)))),
+                "active_scope_summary": _control_summary(active_scope_rows),
             },
         )
         payload = packet.to_dict()
@@ -500,7 +686,148 @@ class AgentMemoryRuntime:
                 "metadata": {"imported_packet_id": packet_id},
             }
         )
-        return {"status": "ok", "ingest": out, "packet_id": packet_id}
+
+        imported_state_rows = 0
+        for row_type in ("claims", "unresolved_contradictions"):
+            for idx, row in enumerate(packet.get(row_type, []) if isinstance(packet.get(row_type, []), list) else []):
+                if not isinstance(row, dict):
+                    continue
+                state_context = normalize_state_context(row.get("state_context")) if "state_context" in row else {}
+                if not state_context:
+                    continue
+                result = self.ingest_event(
+                    {
+                        "thread_id": thread_id,
+                        "event_type": "reflection",
+                        "role": safe_text(packet.get("role"), "unknown", 64),
+                        "source_agent_id": safe_text(source_agent_id, "external_agent", 128),
+                        "source_turn_id": f"{packet_id}:{row_type}:{idx}",
+                        "payload": {
+                            "claim": safe_text(row.get("claim"), f"imported {row_type} row", 2048),
+                            "fact_state": (safe_text(row.get("status"), "asserted", 32).lower() if safe_text(row.get("status"), "", 32).lower() in {"asserted", "verified", "contradicted", "superseded"} else "asserted"),
+                        },
+                        "evidence_refs": merge_evidence_refs(row.get("evidence_refs", []), row.get("evidence_items")),
+                        "evidence_items": normalize_evidence_items(row.get("evidence_items")),
+                        "state_context": state_context,
+                        "confidence": 0.6,
+                        "salience": 0.5,
+                        "metadata": {
+                            "imported_packet_id": packet_id,
+                            "imported_row_index": idx,
+                            "imported_row_type": row_type,
+                        },
+                    }
+                )
+                if result.get("status") in {"ok", "deduped"}:
+                    imported_state_rows += 1
+        return {"status": "ok", "ingest": out, "packet_id": packet_id, "state_rows_imported": imported_state_rows}
+
+    def query_view(
+        self,
+        view: str,
+        *,
+        thread_id: str = "",
+        owner_agent_id: str = "",
+        include_closed: bool = False,
+        limit: int = 50,
+        lookback_hours: float | None = None,
+    ) -> AgentControlView:
+        view_name = safe_text(view, "", 64)
+        owner = safe_text(owner_agent_id, "", 128)
+        if not bool(self.config.enabled):
+            return AgentControlView(view=view_name, thread_id=safe_text(thread_id, "", 128), owner_agent_id=owner)
+
+        rows = self._resolved_control_rows(
+            thread_id=safe_text(thread_id, "", 128),
+            include_closed=bool(include_closed),
+            lookback_hours=lookback_hours,
+        )
+        if view_name == "my_work":
+            if owner:
+                rows = [row for row in rows if row.owner_agent_id == owner]
+            else:
+                rows = [row for row in rows if row.owner_agent_id]
+        elif view_name == "open_gates":
+            rows = [row for row in rows if row.state_kind == "pending_gate" and row.status != "closed"]
+        elif view_name == "stale_claims":
+            rows = [row for row in rows if row.freshness_state in {"stale", "unknown"}]
+        elif view_name == "contradictions":
+            rows = [row for row in rows if row.has_contradiction or row.conflict]
+        else:
+            rows = list(rows)
+
+        rows = rows[: max(1, int(limit))]
+        return AgentControlView(
+            view=view_name,
+            thread_id=safe_text(thread_id, "", 128),
+            owner_agent_id=owner,
+            rows=rows,
+            metadata={
+                "include_closed": bool(include_closed),
+                "limit": int(max(1, int(limit))),
+                "lookback_hours": float(self._lookback_hours(lookback_hours)),
+                "total_rows": int(len(rows)),
+            },
+        )
+
+    def reconcile(self, thread_id: str, *, limit: int = 50) -> Dict[str, Any]:
+        fn = self.hooks.reconcile_state
+        if not callable(fn):
+            return {"status": "unsupported", "reason": "no_reconcile_hook"}
+        active = self.query_view(
+            "active_scopes",
+            thread_id=safe_text(thread_id, "", 128),
+            include_closed=False,
+            limit=max(1, int(limit)),
+            lookback_hours=self._lookback_hours(None),
+        ).to_dict()
+        try:
+            rows = fn(safe_text(thread_id, "", 128), list(active.get("rows", [])))
+        except Exception as exc:
+            if bool(self.config.fail_open):
+                self._record_fail_open("reconcile", str(exc))
+                return {"status": "fail_open", "reason": str(exc)}
+            raise
+        if not isinstance(rows, list):
+            return {"status": "invalid", "reason": "reconcile_hook_must_return_list"}
+
+        ingested = 0
+        invalid = 0
+        errors: List[Dict[str, Any]] = []
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                invalid += 1
+                errors.append({"index": idx, "reason": "not_a_dict"})
+                continue
+            payload = dict(row)
+            state_context = payload.get("state_context") if "state_context" in payload else None
+            payload.setdefault("thread_id", safe_text(thread_id, "", 128))
+            payload.setdefault("event_type", "reflection")
+            payload.setdefault("role", "operator")
+            payload.setdefault("source_agent_id", "runtime_reconcile")
+            payload.setdefault("source_turn_id", f"reconcile_{idx}")
+            raw_payload = payload.get("payload", {}) if isinstance(payload.get("payload", {}), dict) else {}
+            if not any(safe_text(raw_payload.get(key), "", 2048) for key in ("claim", "decision", "outcome")):
+                scope_id = safe_text((state_context or {}).get("scope_id"), "scope", 256)
+                raw_payload["claim"] = f"reconciled state for {scope_id}"
+            payload["payload"] = raw_payload
+            if state_context is not None:
+                payload["state_context"] = state_context
+            result = self.ingest_event(payload)
+            if result.get("status") in {"ok", "deduped"}:
+                ingested += 1
+            else:
+                invalid += 1
+                errors.append({"index": idx, "result": dict(result)})
+
+        return {
+            "status": "ok",
+            "thread_id": safe_text(thread_id, "", 128),
+            "seen": int(len(rows)),
+            "ingested": int(ingested),
+            "invalid": int(invalid),
+            "errors": errors,
+        }
 
     def snapshot(self) -> Dict[str, Any]:
         now_ts = float(time.time())
@@ -528,7 +855,7 @@ class AgentMemoryRuntime:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
                     row = json.load(handle)
-                ts = datetime.fromisoformat(str(row.get("generated_at", "")).replace("Z", "+00:00")).timestamp()
+                ts = parse_ts_value(row.get("generated_at")) or 0.0
                 if ts < cutoff_ts:
                     continue
                 brief_recent += 1
@@ -559,7 +886,7 @@ class AgentMemoryRuntime:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
                     row = json.load(handle)
-                ts = datetime.fromisoformat(str(row.get("generated_at", "")).replace("Z", "+00:00")).timestamp()
+                ts = parse_ts_value(row.get("generated_at")) or 0.0
                 if ts < cutoff_ts:
                     continue
                 handoff_recent += 1
@@ -582,11 +909,20 @@ class AgentMemoryRuntime:
             except Exception:
                 continue
 
+        active_view = self.query_view("active_scopes", include_closed=False, limit=max(1, int(self.config.max_event_tail)), lookback_hours=24.0).to_dict()
+        open_gates_view = self.query_view("open_gates", include_closed=False, limit=max(1, int(self.config.max_event_tail)), lookback_hours=24.0).to_dict()
+        active_rows = active_view.get("rows", []) if isinstance(active_view.get("rows", []), list) else []
+        open_gate_rows = open_gates_view.get("rows", []) if isinstance(open_gates_view.get("rows", []), list) else []
+        owner_covered = sum(1 for row in active_rows if safe_text((row or {}).get("owner_agent_id"), "", 128))
+        freshness_covered = sum(1 for row in active_rows if safe_text((row or {}).get("freshness_state"), "", 16) != "unknown")
+        stale_rows = sum(1 for row in active_rows if safe_text((row or {}).get("freshness_state"), "", 16) == "stale")
+        conflict_rows = sum(1 for row in active_rows if bool((row or {}).get("conflict")))
+
         last_update_ts = safe_text(self.store.state.get("last_update_ts"), "", 64)
         state_age = None
         if last_update_ts:
             try:
-                state_age = now_ts - datetime.fromisoformat(last_update_ts.replace("Z", "+00:00")).timestamp()
+                state_age = now_ts - (parse_ts_value(last_update_ts) or now_ts)
             except Exception:
                 state_age = None
 
@@ -607,6 +943,12 @@ class AgentMemoryRuntime:
             "agent_claim_span_citation_coverage_24h": (float(citation_span_covered / max(1, citation_span_total)) if citation_span_total > 0 else 0.0),
             "agent_claim_excerpt_fidelity_24h": (float(citation_excerpt_covered / max(1, citation_excerpt_total)) if citation_excerpt_total > 0 else 0.0),
             "agent_handoff_span_grounding_rate_24h": (float(handoff_span_covered / max(1, handoff_span_total)) if handoff_span_total > 0 else 0.0),
+            "agent_active_scope_count_24h": int(len(active_rows)),
+            "agent_open_gate_count_24h": int(len(open_gate_rows)),
+            "agent_scope_owner_coverage_24h": (float(owner_covered / max(1, len(active_rows))) if active_rows else 0.0),
+            "agent_active_scope_freshness_coverage_24h": (float(freshness_covered / max(1, len(active_rows))) if active_rows else 0.0),
+            "agent_active_scope_stale_rate_24h": (float(stale_rows / max(1, len(active_rows))) if active_rows else 0.0),
+            "agent_scope_conflict_rate_24h": (float(conflict_rows / max(1, len(active_rows))) if active_rows else 0.0),
             "agent_memory_fail_open_events_24h": int(max(0, int(self.store.state.get("fail_open_events_total", 0)))),
             "agent_memory_last_update_ts": last_update_ts or None,
             "agent_memory_state_age_sec": (float(max(0.0, state_age)) if state_age is not None else None),

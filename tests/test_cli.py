@@ -4,7 +4,7 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
-from evidencespine.cli import _cmd_ingest
+from evidencespine.cli import _cmd_ingest, _cmd_reconcile, _cmd_view
 
 
 def _ingest_args(tmp_path: Path, **overrides) -> Namespace:
@@ -25,6 +25,17 @@ def _ingest_args(tmp_path: Path, **overrides) -> Namespace:
         "evidence_ref": [],
         "evidence_item_json": [],
         "evidence_item_file": [],
+        "scope_id": "",
+        "scope_kind": "",
+        "state_kind": "",
+        "status": "",
+        "owner_agent_id": "",
+        "state_basis": "",
+        "validated_at": "",
+        "validated_by": "",
+        "fresh_until": "",
+        "lease_expires_at": "",
+        "supersedes": "",
         "confidence": 0.6,
         "salience": 0.5,
         "json": True,
@@ -76,3 +87,54 @@ def test_cli_ingest_merges_evidence_refs_and_evidence_items(tmp_path: Path) -> N
     event = _latest_event(tmp_path)
     assert "manual.md#L1" in event["evidence_refs"]
     assert "src/file.py#L40-L42" in event["evidence_refs"]
+
+
+def test_cli_ingest_accepts_state_context_fields(tmp_path: Path) -> None:
+    args = _ingest_args(
+        tmp_path,
+        scope_id="auth-timeout-fix",
+        state_kind="agent_local_work",
+        status="active",
+        owner_agent_id="implementer",
+    )
+    assert _cmd_ingest(args) == 0
+    event = _latest_event(tmp_path)
+    assert event["state_context"]["scope_id"] == "auth-timeout-fix"
+
+
+def test_cli_view_returns_expected_json_shape(tmp_path: Path, capsys) -> None:
+    ingest_args = _ingest_args(
+        tmp_path,
+        scope_id="release-gate",
+        state_kind="pending_gate",
+        status="ready",
+        fresh_until="2099-01-01T00:00:00Z",
+    )
+    assert _cmd_ingest(ingest_args) == 0
+    capsys.readouterr()
+
+    args = Namespace(
+        base_dir=str(tmp_path / ".es"),
+        view_name="active-scopes",
+        thread_id="demo",
+        owner_agent_id="",
+        include_closed=False,
+        limit=50,
+        json=True,
+    )
+    assert _cmd_view(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["view"] == "active_scopes"
+    assert payload["rows"][0]["scope_id"] == "release-gate"
+
+
+def test_cli_reconcile_reports_unsupported_without_hook(tmp_path: Path, capsys) -> None:
+    args = Namespace(
+        base_dir=str(tmp_path / ".es"),
+        thread_id="demo",
+        limit=50,
+        json=True,
+    )
+    assert _cmd_reconcile(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"status": "unsupported", "reason": "no_reconcile_hook"}

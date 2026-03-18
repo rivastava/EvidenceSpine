@@ -7,7 +7,13 @@ from evidencespine.adapters.base import (
     NormalizedTranscriptMessage,
     TranscriptAdapterConfig,
 )
-from evidencespine.protocol import merge_evidence_refs, normalize_evidence_items, safe_float, safe_text
+from evidencespine.protocol import (
+    merge_evidence_refs,
+    normalize_evidence_items,
+    normalize_state_context,
+    safe_float,
+    safe_text,
+)
 from evidencespine.runtime import AgentMemoryRuntime
 
 
@@ -95,8 +101,16 @@ class TranscriptAdapter:
         return safe_text(turn_id, fallback, 128)
 
     def _extract_metadata(self, msg: Any, *, canonical_role: str) -> dict[str, Any]:
+        if isinstance(msg, NormalizedTranscriptMessage):
+            raw = dict(msg.metadata or {})
+            raw["normalized_role"] = canonical_role
+            return raw
         if isinstance(msg, dict):
-            raw = {k: v for k, v in msg.items() if k not in {"content", "text", "evidence_ref", "evidence_refs", "evidence_items"}}
+            raw = {
+                k: v
+                for k, v in msg.items()
+                if k not in {"content", "text", "evidence_ref", "evidence_refs", "evidence_items", "state_context"}
+            }
         else:
             raw = {
                 "raw_type": type(msg).__name__,
@@ -127,9 +141,37 @@ class TranscriptAdapter:
             raw = getattr(msg, "evidence_items", [])
         return normalize_evidence_items(raw)
 
+    def _extract_state_context(self, msg: Any) -> dict[str, Any] | None:
+        if isinstance(msg, dict):
+            if "state_context" not in msg:
+                return None
+            normalized = normalize_state_context(msg.get("state_context"))
+        else:
+            if not hasattr(msg, "state_context"):
+                return None
+            normalized = normalize_state_context(getattr(msg, "state_context"))
+        return (normalized or None)
+
     def normalize_messages(self, messages_or_state: Any) -> List[NormalizedTranscriptMessage]:
         normalized: List[NormalizedTranscriptMessage] = []
         for idx, msg in enumerate(_iter_messages(messages_or_state)):
+            if isinstance(msg, NormalizedTranscriptMessage):
+                normalized.append(
+                    NormalizedTranscriptMessage(
+                        role=safe_text(msg.role, "unknown", 64),
+                        event_type=safe_text(msg.event_type, "reflection", 64),
+                        content=safe_text(msg.content, "", int(max(16, self.config.content_limit))),
+                        turn_id=safe_text(msg.turn_id, f"{self.config.turn_id_prefix}_{idx}", 128),
+                        evidence_ref=safe_text(msg.evidence_ref, f"{self.config.evidence_prefix}:{idx}", 256),
+                        confidence=safe_float(msg.confidence, self.config.default_confidence, 0.0, 1.0),
+                        salience=safe_float(msg.salience, self.config.default_salience, 0.0, 1.0),
+                        evidence_refs=merge_evidence_refs(msg.evidence_refs or [msg.evidence_ref], msg.evidence_items),
+                        evidence_items=normalize_evidence_items(msg.evidence_items),
+                        state_context=(normalize_state_context(msg.state_context) if msg.state_context is not None else None),
+                        metadata=dict(msg.metadata or {}),
+                    )
+                )
+                continue
             role = self._extract_role(msg)
             content = self._extract_content(msg)
             if self.config.skip_empty and not content:
@@ -146,6 +188,7 @@ class TranscriptAdapter:
                     salience=safe_float(self.config.default_salience, 0.5, 0.0, 1.0),
                     evidence_refs=self._extract_evidence_refs(msg, default_ref=f"{self.config.evidence_prefix}:{turn_id}"),
                     evidence_items=self._extract_evidence_items(msg),
+                    state_context=self._extract_state_context(msg),
                     metadata=self._extract_metadata(msg, canonical_role=role),
                 )
             )
@@ -171,6 +214,7 @@ class TranscriptAdapter:
                     },
                     "evidence_refs": merge_evidence_refs(row.evidence_refs or [row.evidence_ref], row.evidence_items),
                     "evidence_items": normalize_evidence_items(row.evidence_items),
+                    "state_context": (normalize_state_context(row.state_context) if row.state_context is not None else None),
                     "confidence": row.confidence,
                     "salience": row.salience,
                     "metadata": dict(row.metadata),

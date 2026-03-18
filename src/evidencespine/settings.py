@@ -48,6 +48,7 @@ class EvidenceSpineSettings:
     brief_top_k_events: int = 32
     brief_top_k_facts: int = 24
     brief_recency_half_life_hours: float = 8.0
+    control_view_lookback_hours: float = 168.0
     retrieval_mode: str = "lexical"
     retrieval_lexical_weight: float = 1.0
     retrieval_vector_weight: float = 0.35
@@ -69,6 +70,7 @@ class EvidenceSpineSettings:
             brief_top_k_events=_env_int("EVIDENCESPINE_BRIEF_TOP_K_EVENTS", 32, 1),
             brief_top_k_facts=_env_int("EVIDENCESPINE_BRIEF_TOP_K_FACTS", 24, 1),
             brief_recency_half_life_hours=_env_float("EVIDENCESPINE_BRIEF_RECENCY_HALF_LIFE_HOURS", 8.0, 0.25),
+            control_view_lookback_hours=_env_float("EVIDENCESPINE_CONTROL_VIEW_LOOKBACK_HOURS", 168.0, 1.0),
             retrieval_mode=retrieval_mode,
             retrieval_lexical_weight=_env_float("EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT", 1.0, 0.0),
             retrieval_vector_weight=_env_float("EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT", 0.35, 0.0),
@@ -91,6 +93,7 @@ class EvidenceSpineSettings:
             brief_top_k_events=int(self.brief_top_k_events),
             brief_top_k_facts=int(self.brief_top_k_facts),
             brief_recency_half_life_hours=float(self.brief_recency_half_life_hours),
+            control_view_lookback_hours=float(self.control_view_lookback_hours),
             retrieval_mode=str(self.retrieval_mode),
             retrieval_lexical_weight=float(self.retrieval_lexical_weight),
             retrieval_vector_weight=float(self.retrieval_vector_weight),

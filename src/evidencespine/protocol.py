@@ -11,6 +11,19 @@ from typing import Any, Dict, List, Tuple
 EVENT_LIFECYCLE = ("intent", "decision", "action", "outcome", "reflection")
 FACT_STATES = ("asserted", "verified", "contradicted", "superseded")
 AGENT_ROLES = ("implementer", "auditor", "researcher", "operator", "unknown")
+STATE_SCOPE_KINDS = ("task", "gate", "blocker", "runtime_state", "thread")
+STATE_KINDS = ("agent_local_work", "global_blocker", "pending_gate", "runtime_validated_state")
+STATE_STATUSES = ("active", "blocked", "ready", "closed", "superseded")
+STATE_BASES = ("reported", "runtime_validated", "derived", "imported")
+FRESHNESS_STATES = ("fresh", "stale", "unknown")
+LEASE_STATES = ("active", "expired", "none")
+
+_STATE_SCOPE_KIND_DEFAULTS = {
+    "agent_local_work": "task",
+    "global_blocker": "blocker",
+    "pending_gate": "gate",
+    "runtime_validated_state": "runtime_state",
+}
 
 
 def utc_now_iso() -> str:
@@ -63,6 +76,21 @@ def normalize_refs(refs: Any) -> List[str]:
     else:
         out = [safe_text(refs, "", 512)]
     return [x for x in out if x]
+
+
+def parse_ts_value(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = safe_text(value, "", 64)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+    except Exception:
+        return None
 
 
 def _canonical_hash(payload: Dict[str, Any]) -> str:
@@ -247,33 +275,291 @@ def evidence_item_excerpt_matches_checksum(item: Any) -> bool:
     return checksum in {digest, f"sha256:{digest}"}
 
 
+@dataclass(frozen=True)
+class StateContext:
+    scope_id: str
+    scope_kind: str = ""
+    state_kind: str = ""
+    status: str = ""
+    owner_agent_id: str = ""
+    state_basis: str = ""
+    validated_at: str = ""
+    validated_by: str = ""
+    fresh_until: str = ""
+    lease_expires_at: str = ""
+    supersedes: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "scope_id": safe_text(self.scope_id, "", 256),
+        }
+        state_kind = safe_text(self.state_kind, "", 64)
+        if state_kind:
+            payload["state_kind"] = state_kind
+        scope_kind = safe_text(self.scope_kind, "", 64) or _STATE_SCOPE_KIND_DEFAULTS.get(state_kind, "")
+        if scope_kind:
+            payload["scope_kind"] = scope_kind
+        status = safe_text(self.status, "", 64)
+        if status:
+            payload["status"] = status
+        owner_agent_id = safe_text(self.owner_agent_id, "", 128)
+        if owner_agent_id:
+            payload["owner_agent_id"] = owner_agent_id
+        state_basis = safe_text(self.state_basis, "", 64)
+        if not state_basis and state_kind:
+            state_basis = "runtime_validated" if state_kind == "runtime_validated_state" else "reported"
+        if state_basis:
+            payload["state_basis"] = state_basis
+        validated_at = safe_text(self.validated_at, "", 64)
+        if validated_at:
+            payload["validated_at"] = validated_at
+        validated_by = safe_text(self.validated_by, "", 128)
+        if validated_by:
+            payload["validated_by"] = validated_by
+        fresh_until = safe_text(self.fresh_until, "", 64)
+        if fresh_until:
+            payload["fresh_until"] = fresh_until
+        lease_expires_at = safe_text(self.lease_expires_at, "", 64)
+        if lease_expires_at:
+            payload["lease_expires_at"] = lease_expires_at
+        supersedes = safe_text(self.supersedes, "", 128)
+        if supersedes:
+            payload["supersedes"] = supersedes
+        metadata = dict(self.metadata or {})
+        if metadata:
+            payload["metadata"] = metadata
+        return payload
+
+
+def normalize_state_context(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, StateContext):
+        return value.to_dict()
+    if not isinstance(value, dict):
+        return {}
+    if not any(
+        [
+            safe_text(value.get("scope_id"), "", 256),
+            safe_text(value.get("scope_kind"), "", 64),
+            safe_text(value.get("state_kind"), "", 64),
+            safe_text(value.get("status"), "", 64),
+            safe_text(value.get("owner_agent_id"), "", 128),
+            safe_text(value.get("state_basis"), "", 64),
+            safe_text(value.get("validated_at"), "", 64),
+            safe_text(value.get("validated_by"), "", 128),
+            safe_text(value.get("fresh_until"), "", 64),
+            safe_text(value.get("lease_expires_at"), "", 64),
+            safe_text(value.get("supersedes"), "", 128),
+            bool(value.get("metadata")),
+        ]
+    ):
+        return {}
+    payload = StateContext(
+        scope_id=safe_text(value.get("scope_id"), "", 256),
+        scope_kind=safe_text(value.get("scope_kind"), "", 64),
+        state_kind=safe_text(value.get("state_kind"), "", 64),
+        status=safe_text(value.get("status"), "", 64),
+        owner_agent_id=safe_text(value.get("owner_agent_id"), "", 128),
+        state_basis=safe_text(value.get("state_basis"), "", 64),
+        validated_at=safe_text(value.get("validated_at"), "", 64),
+        validated_by=safe_text(value.get("validated_by"), "", 128),
+        fresh_until=safe_text(value.get("fresh_until"), "", 64),
+        lease_expires_at=safe_text(value.get("lease_expires_at"), "", 64),
+        supersedes=safe_text(value.get("supersedes"), "", 128),
+        metadata=dict(value.get("metadata", {}) or {}),
+    ).to_dict()
+    return payload
+
+
+def validate_state_context_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    if not isinstance(payload, dict):
+        return False, ["not_a_dict"]
+    errors: List[str] = []
+    scope_id = safe_text(payload.get("scope_id"), "", 256)
+    state_kind = safe_text(payload.get("state_kind"), "", 64)
+    status = safe_text(payload.get("status"), "", 64)
+    scope_kind = safe_text(payload.get("scope_kind"), "", 64) or _STATE_SCOPE_KIND_DEFAULTS.get(state_kind, "")
+    state_basis = safe_text(payload.get("state_basis"), "", 64)
+    if not state_basis and state_kind:
+        state_basis = "runtime_validated" if state_kind == "runtime_validated_state" else "reported"
+
+    if not scope_id:
+        errors.append("missing:scope_id")
+    if not state_kind:
+        errors.append("missing:state_kind")
+    elif state_kind not in STATE_KINDS:
+        errors.append("invalid:state_kind")
+    if not status:
+        errors.append("missing:status")
+    elif status not in STATE_STATUSES:
+        errors.append("invalid:status")
+    if scope_kind and scope_kind not in STATE_SCOPE_KINDS:
+        errors.append("invalid:scope_kind")
+    if state_basis and state_basis not in STATE_BASES:
+        errors.append("invalid:state_basis")
+
+    for key in ("validated_at", "fresh_until", "lease_expires_at"):
+        text = safe_text(payload.get(key), "", 64)
+        if text and parse_ts_value(text) is None:
+            errors.append(f"invalid:{key}")
+
+    if state_basis == "runtime_validated":
+        if not safe_text(payload.get("validated_at"), "", 64):
+            errors.append("missing:validated_at")
+        if not safe_text(payload.get("validated_by"), "", 128):
+            errors.append("missing:validated_by")
+
+    if (
+        status in {"active", "blocked", "ready"}
+        and state_kind in {"global_blocker", "pending_gate", "runtime_validated_state"}
+        and not safe_text(payload.get("fresh_until"), "", 64)
+    ):
+        errors.append("missing:fresh_until")
+
+    if safe_text(payload.get("lease_expires_at"), "", 64) and not safe_text(payload.get("owner_agent_id"), "", 128):
+        errors.append("missing:owner_agent_id")
+
+    if status == "superseded" and not safe_text(payload.get("supersedes"), "", 128):
+        errors.append("missing:supersedes")
+
+    return len(errors) == 0, errors
+
+
+def freshness_state_for_context(value: Any, *, now_ts: float | None = None) -> str:
+    payload = normalize_state_context(value)
+    fresh_until = parse_ts_value(payload.get("fresh_until"))
+    if fresh_until is None:
+        return "unknown"
+    if now_ts is None:
+        now_ts = parse_ts_value(utc_now_iso()) or 0.0
+    return "fresh" if float(now_ts) <= float(fresh_until) else "stale"
+
+
+def lease_state_for_context(value: Any, *, now_ts: float | None = None) -> str:
+    payload = normalize_state_context(value)
+    lease_until = parse_ts_value(payload.get("lease_expires_at"))
+    if lease_until is None:
+        return "none"
+    if now_ts is None:
+        now_ts = parse_ts_value(utc_now_iso()) or 0.0
+    return "active" if float(now_ts) <= float(lease_until) else "expired"
+
+
+@dataclass
+class ControlViewRow:
+    scope_id: str
+    thread_id: str
+    scope_kind: str
+    state_kind: str
+    status: str
+    owner_agent_id: str = ""
+    state_basis: str = ""
+    claim: str = ""
+    source_record_id: str = ""
+    source_record_type: str = ""
+    reported_at: str = ""
+    validated_at: str = ""
+    fresh_until: str = ""
+    freshness_state: str = "unknown"
+    lease_expires_at: str = ""
+    lease_state: str = "none"
+    has_contradiction: bool = False
+    conflict: bool = False
+    evidence_refs: List[str] = field(default_factory=list)
+    evidence_items: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "scope_id": safe_text(self.scope_id, "", 256),
+            "thread_id": safe_text(self.thread_id, "", 128),
+            "scope_kind": safe_text(self.scope_kind, "", 64),
+            "state_kind": safe_text(self.state_kind, "", 64),
+            "status": safe_text(self.status, "", 64),
+            "owner_agent_id": safe_text(self.owner_agent_id, "", 128),
+            "state_basis": safe_text(self.state_basis, "", 64),
+            "claim": safe_text(self.claim, "", 2048),
+            "source_record_id": safe_text(self.source_record_id, "", 128),
+            "source_record_type": safe_text(self.source_record_type, "", 32),
+            "reported_at": safe_text(self.reported_at, "", 64),
+            "validated_at": safe_text(self.validated_at, "", 64),
+            "fresh_until": safe_text(self.fresh_until, "", 64),
+            "freshness_state": safe_text(self.freshness_state, "unknown", 16),
+            "lease_expires_at": safe_text(self.lease_expires_at, "", 64),
+            "lease_state": safe_text(self.lease_state, "none", 16),
+            "has_contradiction": bool(self.has_contradiction),
+            "conflict": bool(self.conflict),
+            "evidence_refs": merge_evidence_refs(self.evidence_refs, self.evidence_items),
+            "evidence_items": normalize_evidence_items(self.evidence_items),
+            "metadata": dict(self.metadata or {}),
+        }
+        return payload
+
+
+def control_row_sort_ts(row: ControlViewRow | Dict[str, Any]) -> float:
+    payload = row.to_dict() if isinstance(row, ControlViewRow) else dict(row or {})
+    for key in ("validated_at", "reported_at", "generated_at", "ts_utc"):
+        ts = parse_ts_value(payload.get(key))
+        if ts is not None:
+            return float(ts)
+    return 0.0
+
+
+@dataclass
+class AgentControlView:
+    view: str
+    generated_at: str = field(default_factory=utc_now_iso)
+    thread_id: str = ""
+    owner_agent_id: str = ""
+    rows: List[ControlViewRow] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": "v2",
+            "view": safe_text(self.view, "", 64),
+            "generated_at": safe_text(self.generated_at, utc_now_iso(), 64),
+            "thread_id": safe_text(self.thread_id, "", 128),
+            "owner_agent_id": safe_text(self.owner_agent_id, "", 128),
+            "rows": [row.to_dict() if isinstance(row, ControlViewRow) else ControlViewRow(**dict(row)).to_dict() for row in list(self.rows or [])],
+            "metadata": dict(self.metadata or {}),
+        }
+
+
 @dataclass
 class ClaimCitation(Sequence[str]):
     primary_ref: str = ""
     evidence_refs: List[str] = field(default_factory=list)
     evidence_items: List[Dict[str, Any]] = field(default_factory=list)
     span_grounded: bool = False
+    state_context: Dict[str, Any] | None = None
 
     @classmethod
     def from_value(cls, value: Any, *, fallback_ref: str = "") -> "ClaimCitation":
         if isinstance(value, ClaimCitation):
             refs = merge_evidence_refs(value.evidence_refs, value.evidence_items)
             primary_ref = safe_text(value.primary_ref, "", 512) or (refs[0] if refs else safe_text(fallback_ref, "", 512))
+            state_context = normalize_state_context(value.state_context) if value.state_context is not None else {}
             return cls(
                 primary_ref=primary_ref,
                 evidence_refs=refs,
                 evidence_items=normalize_evidence_items(value.evidence_items),
                 span_grounded=bool(value.span_grounded or has_grounded_span(value.evidence_items)),
+                state_context=(state_context or None),
             )
         if isinstance(value, dict):
             evidence_items = normalize_evidence_items(value.get("evidence_items"))
             refs = merge_evidence_refs(value.get("evidence_refs"), evidence_items)
             primary_ref = safe_text(value.get("primary_ref"), "", 512) or (refs[0] if refs else safe_text(fallback_ref, "", 512))
+            state_context = normalize_state_context(value.get("state_context")) if "state_context" in value else {}
             return cls(
                 primary_ref=primary_ref,
                 evidence_refs=refs,
                 evidence_items=evidence_items,
                 span_grounded=bool(value.get("span_grounded")) or has_grounded_span(evidence_items),
+                state_context=(state_context or None),
             )
         refs = normalize_refs(value)
         return cls(
@@ -281,6 +567,7 @@ class ClaimCitation(Sequence[str]):
             evidence_refs=refs,
             evidence_items=[],
             span_grounded=False,
+            state_context=None,
         )
 
     def __iter__(self) -> Iterator[str]:
@@ -301,12 +588,16 @@ class ClaimCitation(Sequence[str]):
         evidence_items = normalize_evidence_items(self.evidence_items)
         evidence_refs = merge_evidence_refs(self.evidence_refs, evidence_items)
         primary_ref = safe_text(self.primary_ref, "", 512) or (evidence_refs[0] if evidence_refs else "")
-        return {
+        payload = {
             "primary_ref": primary_ref,
             "evidence_refs": evidence_refs,
             "evidence_items": evidence_items,
             "span_grounded": bool(self.span_grounded or has_grounded_span(evidence_items)),
         }
+        state_context = normalize_state_context(self.state_context) if self.state_context is not None else {}
+        if state_context:
+            payload["state_context"] = state_context
+        return payload
 
 
 def _validate_evidence_items_field(payload: Dict[str, Any], key: str) -> List[str]:
@@ -325,6 +616,20 @@ def _validate_evidence_items_field(payload: Dict[str, Any], key: str) -> List[st
     return errors
 
 
+def _validate_state_context_field(payload: Dict[str, Any], key: str) -> List[str]:
+    if key not in payload:
+        return []
+    raw = payload.get(key)
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return [f"invalid:{key}:not_a_dict"]
+    ok, item_errors = validate_state_context_dict(normalize_state_context(raw))
+    if ok:
+        return []
+    return [f"invalid:{key}:{err}" for err in item_errors]
+
+
 def _validate_claim_citation_value(value: Any) -> List[str]:
     if isinstance(value, (list, tuple, set, str)) or value is None:
         return []
@@ -336,6 +641,7 @@ def _validate_claim_citation_value(value: Any) -> List[str]:
     if "evidence_refs" in value and not isinstance(value.get("evidence_refs"), (list, tuple, set)):
         errors.append("invalid:citation:evidence_refs")
     errors.extend(_validate_evidence_items_field(value, "evidence_items"))
+    errors.extend(_validate_state_context_field(value, "state_context"))
     return errors
 
 
@@ -351,6 +657,7 @@ class AgentMemoryEvent:
     payload: Dict[str, Any] = field(default_factory=dict)
     evidence_refs: List[str] = field(default_factory=list)
     evidence_items: List[Dict[str, Any]] = field(default_factory=list)
+    state_context: Dict[str, Any] | None = None
     confidence: float = 0.5
     salience: float = 0.5
     tags: List[str] = field(default_factory=list)
@@ -380,6 +687,9 @@ class AgentMemoryEvent:
             "tags": [safe_text(x, "", 64) for x in list(self.tags or []) if safe_text(x, "", 64)],
             "metadata": dict(self.metadata or {}),
         }
+        state_context = normalize_state_context(self.state_context) if self.state_context is not None else {}
+        if state_context:
+            payload["state_context"] = state_context
         if payload["role"] not in AGENT_ROLES:
             payload["role"] = "unknown"
         hash_payload = {
@@ -390,6 +700,7 @@ class AgentMemoryEvent:
             "payload": payload["payload"],
             "evidence_refs": payload["evidence_refs"],
             "evidence_items": payload["evidence_items"],
+            "state_context": payload.get("state_context", {}),
         }
         payload["event_hash"] = _canonical_hash(hash_payload)
         if not payload["event_id"]:
@@ -408,6 +719,7 @@ class AgentMemoryFact:
     ts_utc: str = field(default_factory=utc_now_iso)
     evidence_refs: List[str] = field(default_factory=list)
     evidence_items: List[Dict[str, Any]] = field(default_factory=list)
+    state_context: Dict[str, Any] | None = None
     confidence: float = 0.5
     tags: List[str] = field(default_factory=list)
     contradiction_refs: List[str] = field(default_factory=list)
@@ -436,6 +748,9 @@ class AgentMemoryFact:
             "supersedes_fact_id": safe_text(self.supersedes_fact_id, "", 128),
             "metadata": dict(self.metadata or {}),
         }
+        state_context = normalize_state_context(self.state_context) if self.state_context is not None else {}
+        if state_context:
+            payload["state_context"] = state_context
         if not payload["fact_id"]:
             hash_payload = {
                 "thread_id": payload["thread_id"],
@@ -510,6 +825,9 @@ def _normalize_handoff_row(row: Dict[str, Any], *, require_claim: bool) -> Dict[
     status = safe_text(payload.get("status"), "", 32).lower()
     if status:
         payload["status"] = status
+
+    if "state_context" in payload:
+        payload["state_context"] = normalize_state_context(payload.get("state_context"))
     return payload
 
 
@@ -585,6 +903,7 @@ def validate_event_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if et not in EVENT_LIFECYCLE:
         errors.append("invalid:event_type")
     errors.extend(_validate_evidence_items_field(payload, "evidence_items"))
+    errors.extend(_validate_state_context_field(payload, "state_context"))
     return len(errors) == 0, errors
 
 
@@ -596,6 +915,7 @@ def validate_fact_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if state not in FACT_STATES:
         errors.append("invalid:state")
     errors.extend(_validate_evidence_items_field(payload, "evidence_items"))
+    errors.extend(_validate_state_context_field(payload, "state_context"))
     return len(errors) == 0, errors
 
 
@@ -634,6 +954,7 @@ def validate_handoff_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
             if not safe_text(row.get("claim"), "", 2048):
                 errors.append(f"invalid:claims[{idx}]:claim")
             errors.extend(_validate_evidence_items_field(row, "evidence_items"))
+            errors.extend(_validate_state_context_field(row, "state_context"))
     unresolved = payload.get("unresolved_contradictions", [])
     if unresolved and not isinstance(unresolved, list):
         errors.append("invalid:unresolved_contradictions")
@@ -643,6 +964,7 @@ def validate_handoff_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 errors.append(f"invalid:unresolved_contradictions[{idx}]")
                 continue
             errors.extend(_validate_evidence_items_field(row, "evidence_items"))
+            errors.extend(_validate_state_context_field(row, "state_context"))
     errors.extend(_validate_evidence_items_field(payload, "evidence_items"))
     return len(errors) == 0, errors
 
@@ -656,6 +978,7 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     source_turn_id = safe_text(event.get("source_turn_id"), "", 128)
     evidence_items = normalize_evidence_items(event.get("evidence_items"))
     evidence_refs = merge_evidence_refs(event.get("evidence_refs"), evidence_items)
+    state_context = normalize_state_context(event.get("state_context")) if "state_context" in event else None
 
     claims: List[str] = []
     if isinstance(payload.get("claims"), list):
@@ -673,13 +996,13 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     dedup: Dict[str, Dict[str, Any]] = {}
     for claim in claims:
-        c = safe_text(claim, "", 2048)
-        if not c:
+        clean_claim = safe_text(claim, "", 2048)
+        if not clean_claim:
             continue
-        key = _canonical_hash({"thread_id": thread_id, "claim": c})
-        dedup[key] = {
+        key = _canonical_hash({"thread_id": thread_id, "claim": clean_claim})
+        row: Dict[str, Any] = {
             "thread_id": thread_id,
-            "claim": c,
+            "claim": clean_claim,
             "state": state,
             "source_agent_id": source_agent_id,
             "source_turn_id": source_turn_id,
@@ -692,4 +1015,7 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "event_type": safe_text(event.get("event_type"), "reflection", 64).lower(),
             },
         }
+        if state_context is not None:
+            row["state_context"] = dict(state_context)
+        dedup[key] = row
     return list(dedup.values())
