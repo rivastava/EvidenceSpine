@@ -102,18 +102,23 @@ class SqliteStoreBackend(StoreBackend):
         with self._lock:
             conn = self._connect()
             event_hash = safe_text(row.get("event_hash"), "", 128)
-            inserted = conn.execute(
-                "INSERT OR IGNORE INTO dedup_hashes (hash, ts) VALUES (?, ?)",
-                (event_hash, _row_ts_float(row) or float(time.time())),
-            ).rowcount
-            if inserted == 0 and event_hash:
-                return "deduped"
+            row_ts = _row_ts_float(row) or float(time.time())
+            window = max(60.0, float(getattr(self.config, "dedupe_window_sec", 7200.0)))
+            if event_hash:
+                existing = conn.execute("SELECT ts FROM dedup_hashes WHERE hash = ?", (event_hash,)).fetchone()
+                if existing is not None:
+                    existing_ts = float(existing[0] or 0.0)
+                    if time.time() - existing_ts <= window:
+                        return "deduped"
+                    conn.execute("UPDATE dedup_hashes SET ts = ? WHERE hash = ?", (row_ts, event_hash))
+                else:
+                    conn.execute("INSERT OR IGNORE INTO dedup_hashes (hash, ts) VALUES (?, ?)", (event_hash, row_ts))
             conn.execute(
                 "INSERT INTO events (event_id, thread_id, ts, row_json) VALUES (?, ?, ?, ?)",
                 (
                     safe_text(row.get("event_id"), "", 128),
                     safe_text(row.get("thread_id"), "", 128),
-                    _row_ts_float(row),
+                    row_ts,
                     json.dumps(row, ensure_ascii=True),
                 ),
             )
@@ -251,6 +256,9 @@ class SqliteStoreBackend(StoreBackend):
                 fact_cur = conn.execute("DELETE FROM facts WHERE ts IS NOT NULL AND ts < ?", (fact_cutoff,))
             events_removed = int(event_cur.rowcount)
             facts_removed = int(fact_cur.rowcount)
+            window = max(60.0, float(getattr(self.config, "dedupe_window_sec", 7200.0)))
+            hash_cutoff = time.time() - window
+            dedup_removed = int(conn.execute("DELETE FROM dedup_hashes WHERE ts IS NOT NULL AND ts < ?", (hash_cutoff,)).rowcount)
             conn.commit()
             events_kept = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
             facts_kept = int(conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
@@ -259,4 +267,5 @@ class SqliteStoreBackend(StoreBackend):
             "facts_removed": facts_removed,
             "events_kept": events_kept,
             "facts_kept": facts_kept,
+            "dedup_hashes_removed": dedup_removed,
         }

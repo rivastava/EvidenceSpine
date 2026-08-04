@@ -109,6 +109,7 @@ class AgentMemoryStore:
         "commit",
         "excerpt",
         "reference",
+        "written_at",
     }
     _REDACTION_PATTERNS = [
         re.compile(r"\b(sk|api|token|secret)[_-]?[a-z0-9]{8,}\b", re.IGNORECASE),
@@ -429,26 +430,39 @@ class AgentMemoryStore:
                 continue
         return removed
 
-    def write_brief(self, thread_id: str, payload: Dict[str, Any]) -> str:
+    def _write_artifact(self, directory: str, payload: Dict[str, Any], *, thread_id: str, role: str) -> str:
+        """Persist an artifact under ``directory`` with a random filename.
+
+        Filenames are opaque UUIDs so caller-controlled identifiers can never
+        traverse out of the configured directory; ``thread_id``/``role`` live in
+        the JSON payload only. Writes are atomic and exclusive (no silent
+        overwrite within the same timestamp).
+        """
         with self._lock:
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            safe_thread = safe_text(thread_id, "thread", 128)
-            path = os.path.join(str(self.config.briefs_dir), f"{safe_thread}_{ts}.json")
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(self._redact_obj(dict(payload or {})), handle, indent=2, sort_keys=True, ensure_ascii=True)
-            return path
+            directory_real = os.path.realpath(str(directory))
+            os.makedirs(directory_real, exist_ok=True)
+            written_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            body = dict(payload or {})
+            body.setdefault("thread_id", safe_text(thread_id, "thread", 128))
+            body.setdefault("role", safe_text(role, "unknown", 64))
+            body.setdefault("written_at", written_at)
+            for _ in range(8):
+                path = os.path.join(directory_real, f"{uuid4().hex}.json")
+                if os.path.realpath(path).startswith(directory_real + os.sep):
+                    try:
+                        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                    except OSError:
+                        continue
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump(self._redact_obj(body), handle, indent=2, sort_keys=True, ensure_ascii=True)
+                    return path
+            raise OSError("could not create artifact file under {0}".format(directory_real))
+
+    def write_brief(self, thread_id: str, payload: Dict[str, Any]) -> str:
+        return self._write_artifact(str(self.config.briefs_dir), payload, thread_id=thread_id, role="brief")
 
     def write_handoff(self, thread_id: str, role: str, payload: Dict[str, Any]) -> str:
-        with self._lock:
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            safe_thread = safe_text(thread_id, "thread", 128)
-            safe_role = safe_text(role, "unknown", 64)
-            path = os.path.join(str(self.config.handoffs_dir), f"{safe_thread}_{safe_role}_{ts}.json")
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(self._redact_obj(dict(payload or {})), handle, indent=2, sort_keys=True, ensure_ascii=True)
-            return path
+        return self._write_artifact(str(self.config.handoffs_dir), payload, thread_id=thread_id, role=role)
 
     def record_brief_stats(
         self,

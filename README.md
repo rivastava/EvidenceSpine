@@ -236,5 +236,10 @@ Use `Signed-off-by` in commits, for example:
 git commit -s -m "feat: improve adapter replay docs"
 ```
 
+## Security
+See [`docs/SECURITY.md`](docs/SECURITY.md) for the threat model, the
+redaction trade-off (grounded excerpts/references are persisted verbatim),
+grounding confinement, and the HTTP authentication options.
+
 ## Positioning
 EvidenceSpine is not a general orchestration framework. It is a memory + handoff quality layer that can plug into existing stacks (LangGraph, AutoGen, CrewAI, custom runtimes).

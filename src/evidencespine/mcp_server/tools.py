@@ -8,11 +8,21 @@ guarded by a re-entrant lock per backend.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, Optional
 
+from evidencespine.grounding import ground_claim_refs
 
-def register_tools(server: Any, get_runtime: Callable[[], Any]) -> None:
-    """Register EvidenceSpine tools on an MCPServer instance."""
+
+def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: str = "") -> None:
+    """Register EvidenceSpine tools on an MCPServer instance.
+
+    ``source_root`` is the server-configured grounding root (defaults to the
+    server working directory). Server-side grounding rejects absolute paths and
+    confines relative paths to this root so a caller cannot read arbitrary host
+    files.
+    """
+    grounding_root = os.path.realpath(source_root or os.getcwd())
 
     @server.tool(
         name="ingest_event",
@@ -25,7 +35,8 @@ def register_tools(server: Any, get_runtime: Callable[[], Any]) -> None:
             "evidence_refs, evidence_items [{ref, excerpt, checksum}], state_context "
             "{scope_id, state_kind, status, owner_agent_id, fresh_until, ...}, "
             "ground_refs (file:line refs grounded server-side into checksummed "
-            "evidence items), confidence, salience. Returns the ingest result with "
+            "evidence items; relative to the server source root, absolute paths "
+            "rejected), confidence, salience. Returns the ingest result with "
             "status ok|invalid|deduped|disabled|fail_open."
         ),
     )
@@ -38,11 +49,7 @@ def register_tools(server: Any, get_runtime: Callable[[], Any]) -> None:
             if isinstance(ref, str) and str(ref).strip()
         ]
         if ground_refs:
-            import os
-
-            from evidencespine.grounding import ground_claim_refs
-
-            grounded = ground_claim_refs(ground_refs, source_root=os.getcwd())
+            grounded = ground_claim_refs(ground_refs, source_root=grounding_root, allow_absolute=False)
             existing = [dict(x) for x in list(event.get("evidence_items") or [])]
             event["evidence_items"] = [*existing, *grounded]
         return get_runtime().ingest_event(event)
@@ -134,16 +141,16 @@ def register_tools(server: Any, get_runtime: Callable[[], Any]) -> None:
         description=(
             "Build a grounded evidence item from a file:line reference "
             "(path#L10-L20 or path:10-20): reads the excerpt and computes its "
-            "sha256 checksum. Pass source_root for relative paths (defaults to "
-            "the server working directory). Returns the evidence item JSON or "
-            "status ungroundable."
+            "sha256 checksum. The path is resolved relative to the server "
+            "source root; absolute paths and paths escaping the root are "
+            "rejected (status ungroundable)."
         ),
     )
-    def ground(ref: str, source_root: str = "") -> Dict[str, Any]:
+    def ground(ref: str) -> Dict[str, Any]:
         """Ground a file reference into a checksummed evidence item."""
         from evidencespine.grounding import ground_ref
 
-        item = ground_ref(ref, source_root=source_root or ".")
+        item = ground_ref(ref, source_root=grounding_root, allow_absolute=False)
         if item is None:
             return {"status": "ungroundable", "ref": ref}
         return {"status": "ok", "item": item}

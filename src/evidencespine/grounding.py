@@ -62,15 +62,26 @@ def read_lines(path: str, line_start: int, line_end: int) -> Optional[List[str]]
     return [line.rstrip("\n").rstrip("\r") for line in lines[line_start - 1 : end]]
 
 
-def ground_file(path: str, line_start: int, line_end: int, *, source_root: str = ".") -> Optional[Dict[str, Any]]:
+def ground_file(
+    path: str,
+    line_start: int,
+    line_end: int,
+    *,
+    source_root: str = ".",
+    allow_absolute: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Build a grounded evidence item for a file/line range.
 
     ``path`` may be absolute or relative to ``source_root``. Relative paths must
-    resolve inside ``source_root`` (no ``../`` escape); absolute paths are
-    honored as explicit references. Returns None when the file or range cannot
-    be read.
+    resolve inside ``source_root`` (no ``../`` escape). Absolute paths are
+    honored as explicit references only when ``allow_absolute`` is True; when
+    False (server-side grounding), absolute paths are rejected outright so a
+    caller cannot read arbitrary host files. Returns None when the file or
+    range cannot be read.
     """
     if os.path.isabs(path):
+        if not allow_absolute:
+            return None
         full = path
     else:
         root_real = os.path.realpath(str(source_root or "."))
@@ -90,23 +101,29 @@ def ground_file(path: str, line_start: int, line_end: int, *, source_root: str =
     }
 
 
-def ground_ref(ref: str, *, source_root: str = ".") -> Optional[Dict[str, Any]]:
+def ground_ref(ref: str, *, source_root: str = ".", allow_absolute: bool = True) -> Optional[Dict[str, Any]]:
     """Build a grounded evidence item from a ``path#L1-L5`` style reference."""
     parsed = parse_ref(ref)
     if parsed is None:
         return None
     path, start, end = parsed
-    return ground_file(path, start, end, source_root=source_root)
+    return ground_file(path, start, end, source_root=source_root, allow_absolute=allow_absolute)
 
 
-def ground_claim_refs(refs: Any, *, source_root: str = ".", limit: int = 5) -> List[Dict[str, Any]]:
+def ground_claim_refs(
+    refs: Any,
+    *,
+    source_root: str = ".",
+    limit: int = 5,
+    allow_absolute: bool = True,
+) -> List[Dict[str, Any]]:
     """Best-effort grounding for a list of refs; ungroundable refs are skipped."""
     items: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for ref in list(refs or []):
         if not isinstance(ref, str) or not ref.strip():
             continue
-        item = ground_ref(ref, source_root=source_root)
+        item = ground_ref(ref, source_root=source_root, allow_absolute=allow_absolute)
         if item is None:
             continue
         key = f"{item['source_id']}#L{item['line_start']}-{item['line_end']}"

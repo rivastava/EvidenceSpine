@@ -6,6 +6,7 @@ imported lazily inside functions only; importing this module never requires it.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any, Optional
 
@@ -31,6 +32,11 @@ def _build_runtime(
     return AgentMemoryRuntime(config=settings.to_runtime_config())
 
 
+def _grounding_root() -> str:
+    settings = EvidenceSpineSettings.from_env()
+    return os.path.realpath(settings.source_root or os.getcwd())
+
+
 def create_server(
     *,
     base_dir: Optional[str] = None,
@@ -41,6 +47,9 @@ def create_server(
 
     ``runtime`` may be injected (tests/embedding); otherwise one is built lazily
     on first request from ``base_dir`` / ``storage_format`` (or env defaults).
+    Server-side grounding (``ground`` tool, ``ground_refs`` on ingest) is
+    confined to ``EVIDENCESPINE_SOURCE_ROOT`` (or the server cwd) and rejects
+    absolute paths.
     """
     from mcp.server.mcpserver import MCPServer
 
@@ -64,10 +73,44 @@ def create_server(
         description=_SERVER_DESCRIPTION,
         version=__version__,
     )
-    register_tools(server, get_runtime)
+    register_tools(server, get_runtime, source_root=_grounding_root())
     register_resources(server, get_runtime)
     register_prompts(server, get_runtime)
     return server
+
+
+def _static_bearer_middleware(app: Any, token: str) -> Any:
+    """Wrap an ASGI app so every HTTP request must present ``Authorization: Bearer <token>``."""
+
+    expected = "Bearer " + token
+
+    async def dispatch(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+        auth = ""
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"authorization":
+                auth = value.decode("latin-1")
+                break
+        if auth != expected:
+            body = b'{"error":"invalid_token","error_description":"Authentication required"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                        (b"www-authenticate", b'Bearer error="invalid_token"'),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await app(scope, receive, send)
+
+    return dispatch
 
 
 def run_server(
@@ -86,5 +129,26 @@ def run_server(
     server = create_server(base_dir=base_dir, storage_format=storage_format, runtime=runtime)
     if transport == "stdio":
         server.run(transport="stdio")
+        return
+    import uvicorn
+
+    settings = EvidenceSpineSettings.from_env(base_dir=base_dir, storage_format=storage_format)
+    token = str(settings.mcp_auth_token or "").strip()
+    if not token:
+        print(
+            "WARNING: EvidenceSpine MCP streamable-http server is running "
+            "WITHOUT authentication. Set EVIDENCESPINE_MCP_AUTH_TOKEN to require "
+            "a bearer token. Prefer binding to 127.0.0.1 and avoid 0.0.0.0 on "
+            "untrusted networks.",
+            flush=True,
+        )
     else:
-        server.run(transport="streamable-http", host=host, port=int(port), streamable_http_path=path)
+        print(
+            "EvidenceSpine MCP streamable-http server requires "
+            "Authorization: Bearer <EVIDENCESPINE_MCP_AUTH_TOKEN>.",
+            flush=True,
+        )
+    app = server.streamable_http_app(streamable_http_path=path, host=host)
+    if token:
+        app = _static_bearer_middleware(app, token)
+    uvicorn.run(app, host=host, port=int(port), log_level="info")

@@ -56,6 +56,8 @@ class EvidenceSpineSettings:
     retrieval_vector_weight: float = 0.35
     embedding_backend: str = "auto"  # auto | hashing | fastembed
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    source_root: str = ""
+    mcp_auth_token: str = ""
 
     @classmethod
     def from_env(cls, *, base_dir: str | None = None, storage_format: str | None = None) -> "EvidenceSpineSettings":
@@ -85,6 +87,8 @@ class EvidenceSpineSettings:
         retrieval_vector_weight=_env_float("EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT", 0.35, 0.0),
         embedding_backend=str(os.getenv("EVIDENCESPINE_EMBEDDING_BACKEND", "auto")).strip().lower(),
         embedding_model=str(os.getenv("EVIDENCESPINE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")).strip(),
+        source_root=str(os.getenv("EVIDENCESPINE_SOURCE_ROOT", "")).strip(),
+        mcp_auth_token=str(os.getenv("EVIDENCESPINE_MCP_AUTH_TOKEN", "")).strip(),
     )
 
     def to_runtime_config(self) -> AgentMemoryRuntimeConfig:
