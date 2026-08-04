@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Sequence, Tuple
 
+from evidencespine.bm25 import Bm25Scorer
 from evidencespine.protocol import (
     AgentConversationBrief,
     ClaimCitation,
@@ -14,6 +15,7 @@ from evidencespine.protocol import (
     merge_evidence_refs,
     normalize_evidence_items,
     normalize_state_context,
+    strip_inline_refs,
 )
 from evidencespine.vector_backends import VectorBackend
 
@@ -79,6 +81,9 @@ class AgentMemoryRetrieverConfig:
     retrieval_mode: str = "lexical"  # lexical | hybrid | vector
     lexical_weight: float = 1.0
     vector_weight: float = 0.35
+    bm25_enabled: bool = True
+    bm25_k1: float = 1.5
+    bm25_b: float = 0.75
 
 
 class AgentMemoryRetriever:
@@ -104,7 +109,14 @@ class AgentMemoryRetriever:
             return 0.7
         return 0.2
 
-    def score_event(self, row: Dict[str, Any], query_tokens: Sequence[str], now_ts: float) -> float:
+    def score_event(
+        self,
+        row: Dict[str, Any],
+        query_tokens: Sequence[str],
+        now_ts: float,
+        *,
+        rel: float | None = None,
+    ) -> float:
         payload = row.get("payload", {}) if isinstance(row.get("payload", {}), dict) else {}
         text = " ".join(
             [
@@ -115,15 +127,22 @@ class AgentMemoryRetriever:
                 _safe_text(payload.get("outcome"), "", 1024),
             ]
         )
-        rel = _jaccard(query_tokens, _tokenize(text))
+        rel = rel if rel is not None else _jaccard(query_tokens, _tokenize(text))
         rec = self._recency_score(row.get("ts_utc", row.get("ts")), now_ts)
         sal = _safe_float(row.get("salience", payload.get("salience", 0.5)), 0.5, 0.0, 1.0)
         evq = self._evidence_quality_score(row)
         return float(0.45 * rel + 0.25 * rec + 0.20 * sal + 0.10 * evq)
 
-    def score_fact(self, row: Dict[str, Any], query_tokens: Sequence[str], now_ts: float) -> float:
+    def score_fact(
+        self,
+        row: Dict[str, Any],
+        query_tokens: Sequence[str],
+        now_ts: float,
+        *,
+        rel: float | None = None,
+    ) -> float:
         claim = _safe_text(row.get("claim"), "", 2048)
-        rel = _jaccard(query_tokens, _tokenize(claim))
+        rel = rel if rel is not None else _jaccard(query_tokens, _tokenize(claim))
         rec = self._recency_score(row.get("ts_utc", row.get("ts")), now_ts)
         conf = _safe_float(row.get("confidence", 0.5), 0.5, 0.0, 1.0)
         evq = self._evidence_quality_score(row)
@@ -189,23 +208,38 @@ class AgentMemoryRetriever:
         mode = _safe_text(self.config.retrieval_mode, "lexical", 16).lower()
         use_vector = mode in {"hybrid", "vector"} and self.vector_backend is not None
 
-        scored_events: List[Tuple[float, Dict[str, Any]]] = []
         event_rows: List[Dict[str, Any]] = [row for row in events if isinstance(row, dict)]
+        fact_rows: List[Dict[str, Any]] = [row for row in facts if isinstance(row, dict)]
         event_texts = [self._event_text(row) for row in event_rows]
+        fact_texts = [self._fact_text(row) for row in fact_rows]
+
+        bm25_events = None
+        bm25_facts = None
+        if bool(self.config.bm25_enabled):
+            bm25_events = Bm25Scorer(k1=float(self.config.bm25_k1), b=float(self.config.bm25_b))
+            bm25_facts = Bm25Scorer(k1=float(self.config.bm25_k1), b=float(self.config.bm25_b))
+            for idx, row in enumerate(event_rows):
+                bm25_events.add_document(_safe_text(row.get("event_id"), f"evt{idx}", 128), event_texts[idx])
+            for idx, row in enumerate(fact_rows):
+                bm25_facts.add_document(_safe_text(row.get("fact_id"), f"fact{idx}", 128), fact_texts[idx])
+        event_bm25 = bm25_events.normalize(bm25_events.scores(query_tokens)) if bm25_events is not None else None
+        fact_bm25 = bm25_facts.normalize(bm25_facts.scores(query_tokens)) if bm25_facts is not None else None
+
         event_vector_scores = self._vector_scores(query, event_texts) if use_vector else [0.0] * len(event_rows)
+        scored_events: List[Tuple[float, Dict[str, Any]]] = []
         for idx, row in enumerate(event_rows):
-            lexical = self.score_event(row, query_tokens, now_ts)
+            rel = event_bm25[idx] if event_bm25 is not None else _jaccard(query_tokens, _tokenize(event_texts[idx]))
+            lexical = self.score_event(row, query_tokens, now_ts, rel=rel)
             vector = event_vector_scores[idx]
             score = self._combine_scores(lexical, vector)
             scored_events.append((score, row))
         scored_events.sort(key=lambda it: (it[0], _safe_text(it[1].get("event_id"), "", 128)), reverse=True)
 
-        scored_facts: List[Tuple[float, Dict[str, Any]]] = []
-        fact_rows: List[Dict[str, Any]] = [row for row in facts if isinstance(row, dict)]
-        fact_texts = [self._fact_text(row) for row in fact_rows]
         fact_vector_scores = self._vector_scores(query, fact_texts) if use_vector else [0.0] * len(fact_rows)
+        scored_facts: List[Tuple[float, Dict[str, Any]]] = []
         for idx, row in enumerate(fact_rows):
-            lexical = self.score_fact(row, query_tokens, now_ts)
+            rel = fact_bm25[idx] if fact_bm25 is not None else _jaccard(query_tokens, _tokenize(fact_texts[idx]))
+            lexical = self.score_fact(row, query_tokens, now_ts, rel=rel)
             vector = fact_vector_scores[idx]
             score = self._combine_scores(lexical, vector)
             scored_facts.append((score, row))
@@ -245,9 +279,15 @@ class AgentMemoryRetriever:
         facts: Sequence[Dict[str, Any]],
         unresolved_contradictions: Sequence[Dict[str, Any]] | None = None,
         token_budget: int | None = None,
+        superseded_claim_keys: set[str] | None = None,
     ) -> AgentConversationBrief:
         budget = max(64, int(token_budget if token_budget is not None else self.config.max_tokens))
         top_events, top_facts = self.retrieve(query=query, events=events, facts=facts)
+        superseded = {str(key).strip().lower() for key in (superseded_claim_keys or set())}
+
+        def _is_superseded(text: str) -> bool:
+            clean, _ = strip_inline_refs(_safe_text(text, "", 2048))
+            return clean.strip().lower() in superseded
 
         current_goal: List[str] = []
         locked_decisions: List[str] = []
@@ -263,7 +303,7 @@ class AgentMemoryRetriever:
             state_context = normalize_state_context(event.get("state_context")) if "state_context" in event else None
             if not current_goal:
                 goal = _safe_text(payload.get("current_goal", payload.get("goal", "")), "", 512)
-                if goal:
+                if goal and not _is_superseded(goal):
                     line, citation = self._claim_with_citation(
                         goal,
                         event.get("evidence_refs", []),
@@ -275,7 +315,7 @@ class AgentMemoryRetriever:
                     citations[line] = citation
             if et == "decision":
                 decision = _safe_text(payload.get("decision", payload.get("claim", "")), "", 512)
-                if decision:
+                if decision and not _is_superseded(decision):
                     line, citation = self._claim_with_citation(
                         decision,
                         event.get("evidence_refs", []),
@@ -288,7 +328,7 @@ class AgentMemoryRetriever:
             if isinstance(payload.get("next_actions"), list):
                 for action in payload.get("next_actions", [])[:3]:
                     txt = _safe_text(action, "", 512)
-                    if not txt:
+                    if not txt or _is_superseded(txt):
                         continue
                     line, citation = self._claim_with_citation(
                         txt,
@@ -314,6 +354,11 @@ class AgentMemoryRetriever:
                 state_context,
             )
             citations[line] = citation
+            fact_meta = fact.get("metadata", {}) if isinstance(fact.get("metadata", {}), dict) else {}
+            if bool(fact_meta.get("evidence_stale")):
+                risk_line = f"STALE EVIDENCE ({_safe_text(fact_meta.get('evidence_stale_reason'), 'changed', 16)}): {line}"
+                active_risks.append(risk_line)
+                citations[risk_line] = citation
             if state == "verified":
                 recent_verified_facts.append(line)
             elif state == "contradicted":
@@ -349,14 +394,39 @@ class AgentMemoryRetriever:
             ("next_actions", next_actions),
         ]
 
+        def _section_key(text: str) -> str:
+            clean, _ = strip_inline_refs(text)
+            return clean.strip().lower()
+
+        deduped: Dict[str, List[str]] = {name: [] for name, _ in ordered_sections}
+        for name, rows in ordered_sections:
+            seen: set[str] = set()
+            for line in rows:
+                key = _section_key(line)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                deduped[name].append(line)
+        if deduped["open_items"]:
+            stronger = {
+                _section_key(line)
+                for section in ("locked_decisions", "recent_verified_facts")
+                for line in deduped[section]
+            }
+            if stronger:
+                deduped["open_items"] = [
+                    line for line in deduped["open_items"] if _section_key(line) not in stronger
+                ]
+        ordered_sections = [(name, deduped[name]) for name, _ in ordered_sections]
+
         used = 0
         trimmed: Dict[str, List[str]] = {name: [] for name, _ in ordered_sections}
         for name, rows in ordered_sections:
-            for row in rows:
-                cost = _estimate_tokens(row)
+            for line in rows:
+                cost = _estimate_tokens(line)
                 if used + cost > budget:
                     break
-                trimmed[name].append(row)
+                trimmed[name].append(line)
                 used += cost
 
         included_rows = set(sum(trimmed.values(), []))

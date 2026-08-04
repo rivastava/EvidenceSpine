@@ -1,8 +1,11 @@
 from pathlib import Path
 
+import pytest
+
 from evidencespine.adapters import AutoGenAdapter, LangGraphAdapter, TranscriptAdapter
 from evidencespine.runtime import AgentMemoryRuntime
 from evidencespine.settings import EvidenceSpineSettings
+from evidencespine.vector_backends import HashingVectorBackend
 
 
 class _MockVectorBackend:
@@ -128,3 +131,30 @@ def test_existing_public_adapter_methods_still_exist(tmp_path: Path) -> None:
     assert callable(ag.ingest_messages)
     assert callable(ag.brief)
     assert callable(ag.handoff)
+
+
+def test_embedding_backend_auto_falls_back_to_hashing(tmp_path: Path) -> None:
+    settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"))
+    settings.retrieval_mode = "hybrid"
+    settings.embedding_backend = "auto"
+    rt = AgentMemoryRuntime(config=settings.to_runtime_config())
+    assert isinstance(rt.retriever.vector_backend, HashingVectorBackend)
+    rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "decision",
+            "source_agent_id": "impl",
+            "source_turn_id": "a",
+            "payload": {"claim": "vector signal works"},
+        }
+    )
+    brief = rt.build_brief("demo", "vector signal").to_dict()
+    assert brief["recent_verified_facts"] or brief["locked_decisions"]
+
+
+def test_embedding_backend_fastembed_requires_extra(tmp_path: Path) -> None:
+    settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"))
+    settings.retrieval_mode = "hybrid"
+    settings.embedding_backend = "fastembed"
+    with pytest.raises(ImportError, match="embeddings"):
+        AgentMemoryRuntime(config=settings.to_runtime_config())

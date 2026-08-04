@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from evidencespine.adapters import TranscriptAdapter, TranscriptAdapterConfig
+from evidencespine.adapters import TranscriptAdapter
 from evidencespine.runtime import AgentMemoryRuntime
 from evidencespine.settings import EvidenceSpineSettings
 
@@ -98,8 +97,7 @@ def test_transcript_adapter_preserves_caller_evidence_items(tmp_path: Path) -> N
     assert rows[0].evidence_items[0]["source_id"] == "src/file.py"
 
     adapter.ingest_messages(rows)
-    events_path = tmp_path / ".es" / "events.jsonl"
-    latest = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    latest = list(runtime.store.iter_events())[-1]
     assert latest["evidence_items"][0]["source_id"] == "src/file.py"
 
 
@@ -125,6 +123,5 @@ def test_transcript_adapter_preserves_state_context_from_raw_messages(tmp_path: 
     assert rows[0].state_context["scope_id"] == "auth-timeout-fix"
 
     adapter.ingest_messages(rows)
-    events_path = tmp_path / ".es" / "events.jsonl"
-    latest = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    latest = list(runtime.store.iter_events())[-1]
     assert latest["state_context"]["owner_agent_id"] == "implementer"

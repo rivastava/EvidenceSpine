@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from evidencespine.adapters.base import TranscriptAdapterConfig
 from evidencespine.adapters.transcript import TranscriptAdapter
 from evidencespine.runtime import AgentMemoryRuntime
 

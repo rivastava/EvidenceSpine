@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 try:
     import requests
@@ -312,9 +312,9 @@ class Runner(Protocol):
 
 
 class EvidenceSpineRunner:
-    def __init__(self, *, base_dir: Path, mode: str) -> None:
-        self.name = f"evidencespine_{mode}"
-        settings = EvidenceSpineSettings.from_env(base_dir=str(base_dir))
+    def __init__(self, *, base_dir: Path, mode: str, storage_format: str = "sqlite") -> None:
+        self.name = f"evidencespine_{'jsonl_' if storage_format == 'jsonl' else ''}{mode}"
+        settings = EvidenceSpineSettings.from_env(base_dir=str(base_dir), storage_format=storage_format)
         settings.retrieval_mode = mode
         settings.retrieval_lexical_weight = 1.0
         settings.retrieval_vector_weight = 0.35
@@ -805,6 +805,8 @@ def _build_runner(name: str, root: Path) -> Runner:
     n = name.strip().lower()
     if n == "evidencespine_lexical":
         return EvidenceSpineRunner(base_dir=root / n, mode="lexical")
+    if n == "evidencespine_jsonl_lexical":
+        return EvidenceSpineRunner(base_dir=root / n, mode="lexical", storage_format="jsonl")
     if n == "evidencespine_hybrid":
         return EvidenceSpineRunner(base_dir=root / n, mode="hybrid")
     if n == "evidencespine_vector":
@@ -1019,7 +1021,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--runners",
-        default="evidencespine_lexical,evidencespine_hybrid,baseline_sqlite,mem0,letta",
+        default="evidencespine_lexical,evidencespine_jsonl_lexical,evidencespine_hybrid,baseline_sqlite,mem0,letta",
         help="comma-separated runners",
     )
     parser.add_argument("--out-json", default="benchmarks/results/apples_to_apples.json")

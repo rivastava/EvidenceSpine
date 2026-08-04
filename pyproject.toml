@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evidencespine"
-version = "0.4.0"
+version = "0.5.0"
 description = "Agent-agnostic evidence-bound conversation memory fabric"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,17 @@ Issues = "https://github.com/rivastava/EvidenceSpine/issues"
 [project.scripts]
 evidencespine = "evidencespine.cli:main"
 
+[project.optional-dependencies]
+mcp = ["mcp>=2.0"]
+embeddings = ["fastembed>=0.3"]
+a2a = ["a2a-sdk>=1.1.2", "a2a-sdk[fastapi]"]
+all = [
+  "mcp>=2.0",
+  "fastembed>=0.3",
+  "a2a-sdk>=1.1.2",
+  "a2a-sdk[fastapi]",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -41,3 +52,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 addopts = "-q"
+filterwarnings = [
+    "ignore:label\\(\\) is deprecated:DeprecationWarning:a2a\\.utils\\.proto_utils",
+]

@@ -21,7 +21,7 @@ Modes:
 ## Run
 
 ```bash
-cd oss/evidencespine
+cd evidencespine
 PYTHONPATH=src python benchmarks/bench_evidencespine.py \
   --events 2000 \
   --brief-queries 100 \

@@ -181,9 +181,60 @@ Each row includes:
 - `freshness_state`
 - `lease_state`
 - `has_contradiction`
-- `conflict`
+- `conflict` — true only when live rows within the same `state_kind`
+  disagree on `status` or `state_basis` (genuine disagreement, not
+  coordination)
+- `multi_owner` — true when multiple owners report live state for the
+  scope; coordination is exposed separately from `conflict`
 - `evidence_refs`
 - `evidence_items`
+
+## Supersession
+
+- Facts may carry `supersedes_fact_id`; a fact referenced by a live fact's
+  `supersedes_fact_id` is excluded from briefs and control rows.
+- Ingests accept `payload.supersedes_ref` (or event-level
+  `supersedes_fact_id`) to supersede explicitly.
+- Verified claims auto-supersede an asserted twin with identical claim text
+  in the same thread.
+- Briefs exclude superseded facts and suppress superseded decision/action
+  event claims, so resolved items stop surfacing as locked decisions.
+
+## Verification provenance
+
+- Ingest accepts `payload.verification = {method, reference, verified_at, verified_by}` with
+  `method` in `test|gate|tool|manual`; it is stored as `metadata.verification` on facts.
+- `verify_fact` (MCP) / `evidencespine verify` record provenance by ingesting a
+  verified copy of a fact (claim + grounded items preserved) that supersedes the
+  original.
+- Snapshot reports `agent_fact_provenance_rate_24h`.
+
+## Verified-requires-span policy
+
+- With `verified_requires_span` (default on, env `EVIDENCESPINE_VERIFIED_REQUIRES_SPAN`),
+  a `fact_state: verified` claim must be grounded: a checksummed excerpt
+  (`excerpt` + matching `checksum`) or verification provenance. Ungrounded
+  verified claims are stored as `asserted` with
+  `metadata.policy = "verified_requires_span"`; ingests report
+  `policy_downgrades` in the result.
+
+## Evidence staleness (drift)
+
+- `check_drift` (MCP) / `evidencespine drift-check` re-reads each grounded
+  source at the stored line range, recomputes the checksum, and flags
+  `metadata.evidence_stale = true` + `evidence_stale_reason`
+  (`changed` | `missing`) + `evidence_stale_at` (apply mode).
+- Stale facts surface in `stale_claims` (state_kind `evidence`), briefs
+  (`STALE EVIDENCE (reason): ...` in active risks), and the snapshot metric
+  `agent_evidence_stale_count_24h`.
+
+## Chat rooms
+
+`evidencespine chat` stores messages as events with:
+- `payload.chat` — message text (no `claim`/`decision` keys, so no facts)
+- `metadata.chat_room`, `metadata.chat_seq` (monotonic), `metadata.chat_topic`
+- summary events additionally carry `metadata.chat_summary = 1` and
+  `metadata.chat_summarized_through`
 
 ## Compatibility
 

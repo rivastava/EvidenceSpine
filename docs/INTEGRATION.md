@@ -121,13 +121,21 @@ runtime.reconcile("session_1")
 
 ## 5) Hybrid retrieval mode
 
-Use env:
+Retrieval uses BM25 lexical scoring (fallback: jaccard). Enable hybrid or
+vector mode and pick a vector backend:
 
 ```bash
-export EVIDENCESPINE_RETRIEVAL_MODE=hybrid
+export EVIDENCESPINE_RETRIEVAL_MODE=hybrid   # or vector
 export EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT=1.0
 export EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT=0.35
+export EVIDENCESPINE_EMBEDDING_BACKEND=auto  # auto | fastembed | hashing
+export EVIDENCESPINE_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ```
+
+- `auto` (default) uses fastembed when the `[embeddings]` extra is installed,
+  otherwise falls back to a dependency-free hashing backend.
+- `fastembed` requires the extra: `pip install evidencespine[embeddings]`.
+- `hashing` forces the dependency-free backend.
 
 Or inject your own backend:
 
@@ -198,6 +206,175 @@ PYTHONPATH=src python examples/transcript_replay_harness.py \
   examples/replay_fixtures/implementer_auditor_trace.json
 
 PYTHONPATH=src python examples/langgraph_replay_demo.py
+```
+
+## 8a) MCP server (optional extra)
+
+```bash
+pip install "evidencespine[mcp]"
+evidencespine mcp                       # stdio transport
+evidencespine mcp --transport streamable-http --port 8000
+```
+
+Tools: `ingest_event`, `build_brief`, `query_view`, `emit_handoff`,
+`import_handoff`, `reconcile`, `snapshot`, `prune`.
+Resources: `evidencespine://brief/{thread_id}`, `evidencespine://view/{view}`,
+`evidencespine://state/{scope_id}`, `evidencespine://snapshot`.
+Prompts: `session_start`, `handoff_receive`, `handoff_send`.
+
+## 8b) Harness delivery layer (auto-recall / auto-retain)
+
+```bash
+evidencespine harness install --harness all
+evidencespine harness debug
+```
+
+Writes a Claude Code plugin manifest, an opencode plugin (brief injection at
+session start, retention through compaction, handoff on session end), and a
+Cursor MCP config. Session hooks fail open: without a store, `session-start`
+returns a one-line notice instead of failing the session.
+
+### Supported harness matrix
+
+| Harness | Install target | What is wired |
+| --- | --- | --- |
+| opencode | `.opencode/plugins/evidencespine.ts` (or global) | plugin + MCP server, session-start/stop/compaction |
+| claude-code | `.claude-plugin/plugin.json` | session-start/stop/precompact hooks |
+| cursor | `.cursor/mcp.json` | MCP server registration |
+| git | `.git/hooks/` post-commit/post-merge | commit spans + test-record |
+| codex | — (manual, see `docs/CODEX.md`) | AGENTS.md guidance + manual MCP registration; full `install_codex` harness wiring is planned, not yet shipped |
+
+The MCP server itself is harness-agnostic: any MCP-capable client (opencode,
+Cursor, Claude Code, Codex CLI/IDE/desktop, generic MCP apps) gets the same
+tools and resources, so agents reach the spine even without a harness install.
+A2A, the async runtime, the CLI, and the framework adapters
+(`TranscriptAdapter`, LangGraph, AutoGen) are additional harness-agnostic
+channels.
+
+### How agents discover EvidenceSpine
+
+Guidance reaches agents through three complementary layers:
+
+1. **`AGENTS.md` (committed at the repo root)** — the opencode, Codex, Cursor,
+   and Claude Code convention for agent instructions: a concise primer on what
+   the spine is and decision rules for when to consult it (consult a brief
+   before asserting project state; ground + mark verified when claiming
+   something is fixed; re-verify evidence after edits; import/emit handoffs at
+   role boundaries). The same file is read by all four harnesses — one source,
+   no per-harness instruction sets. It is generated from the canonical
+   `usage_guide_markdown()` constant (`src/evidencespine/usage.py`) and a sync
+   test fails if the two drift.
+2. **MCP tool and resource descriptions** — every tool teaches its own use
+   case; resources (`evidencespine://brief/{thread}`, `//view/{view}`,
+   `//state/{scope}`, `//snapshot`) are progressive-disclosure surfaces. The
+   `evidencespine://guide` resource mirrors the AGENTS.md rules for any MCP
+   agent at runtime.
+3. **The session-start injection** — the auto-recall brief opens with the
+   operating rules (locked decisions are binding unless superseded; act
+   against a verified fact only by recording the contradiction; open items and
+   next actions are the queue) plus the decision rules (consult the spine
+   before asserting project state; ground what you mark verified; re-verify
+   after edits; emit a handoff at role change), injected automatically by the
+   opencode plugin and claude-code hooks.
+
+## 8c) A2A protocol server (optional extra)
+
+```bash
+pip install "evidencespine[a2a]"
+evidencespine a2a --host 127.0.0.1 --port 8765
+curl http://127.0.0.1:8765/.well-known/agent-card.json
+```
+
+The agent card advertises `memory.read`, `memory.write`, `memory.handoff`,
+and `memory.health` skills. Send an A2A message containing a JSON body
+`{"action": "build_brief", "thread_id": "...", "params": {...}}` (or plain
+text, treated as a brief query) to the JSON-RPC endpoint.
+
+## 8d) Async wrapper
+
+```python
+from evidencespine import AsyncAgentMemoryRuntime
+
+rt = AsyncAgentMemoryRuntime(base_dir=".evidencespine")
+await rt.ingest_event({...})
+brief = await rt.build_brief("session_1", "what matters now")
+```
+
+All blocking I/O runs in worker threads; methods mirror the sync runtime and
+return plain dicts.
+
+## 8e) TTL archival
+
+```bash
+evidencespine prune --ttl-hours 720 --dry-run --json   # preview
+evidencespine prune --ttl-hours 720 --json            # delete old rows
+```
+
+Rows without a parseable timestamp are always kept. The runtime method
+`runtime.prune(...)` and the MCP `prune` tool expose the same behavior.
+
+## 8f) Realtime debate chat
+
+`evidencespine chat` turns the spine into a live message bus: one polling
+loop per role, each reading the room from the store, replying through an LLM
+backend, and publishing back. Agents read each other's messages before every
+reply; the debate ends on consensus (`AGREE:` from every role), a quiet
+period, a message budget, or a duration cap.
+
+```bash
+# quick debate with the default roles
+evidencespine chat --topic "Is this feature worth building?"
+
+# long, self-sustaining session (see docs/DEBATE.md for the full runbook)
+evidencespine chat --topic "<topic>" --minutes 45 --facilitate \
+  --max-messages 200 --window-size 12 --max-reply-words 40
+```
+
+Chat messages are stored as room events (monotonic `chat_seq`), never as
+facts, so they do not pollute briefs. See `docs/DEBATE.md` for all controls
+and the opencode verification notes.
+
+## 8g) Grounded evidence: spans, policy, drift, provenance
+
+Grounded evidence binds claims to exact, checksummed file excerpts.
+
+```bash
+# build a grounded evidence item from a file:line ref
+evidencespine ground "src/mod.py#L10-L20"
+
+# ingest a verified claim that is actually grounded (survives the policy)
+evidencespine ingest --claim "fix shipped" --fact-state verified \
+  --ground-ref "src/mod.py#L10-L20" --thread-id demo --event-type outcome \
+  --source-agent-id me --source-turn-id t1
+
+# policy: fact_state=verified without a grounded item or provenance is
+# stored as asserted (metadata.policy = verified_requires_span).
+# Disable with EVIDENCESPINE_VERIFIED_REQUIRES_SPAN=0.
+
+# drift-check: re-verify grounded evidence against live files
+evidencespine drift-check --source-root .            # preview
+evidencespine drift-check --source-root . --apply    # write evidence_stale flags
+# stale facts surface in `view stale_claims`, briefs (STALE EVIDENCE risks),
+# and the snapshot metric agent_evidence_stale_count_24h.
+
+# provenance: record how a fact was verified (test/gate/tool/manual)
+evidencespine verify --fact-id amf_... --method test \
+  --reference "pytest tests/test_mod.py" --verified-by qa
+```
+
+The same operations are MCP tools: `ground`, `check_drift`, `verify_fact`.
+
+## 8h) Thin git/test hooks
+
+```bash
+# install post-commit + post-merge hooks (span ingestion per commit)
+evidencespine harness git install-hook --target-dir . --executable evidencespine
+
+# manual commit record with grounded spans from diff hunks
+evidencespine harness git git-hook --sha <sha> --repo-dir .
+
+# record a test run (green -> verified fact with provenance)
+evidencespine harness git test-record --status passed --command "pytest tests/"
 ```
 
 ## 9) Operational checklist

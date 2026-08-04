@@ -1,5 +1,7 @@
 """EvidenceSpine: evidence-bound multi-agent conversation memory fabric."""
 
+__version__ = "0.5.0"
+
 from evidencespine.protocol import (
     AgentConversationBrief,
     AgentControlView,
@@ -22,8 +24,10 @@ from evidencespine.adapters import (
     TranscriptAdapter,
     TranscriptAdapterConfig,
 )
+from evidencespine.async_runtime import AsyncAgentMemoryRuntime
 
 __all__ = [
+    "__version__",
     "AgentMemoryEvent",
     "AgentMemoryFact",
     "AgentConversationBrief",
@@ -36,6 +40,7 @@ __all__ = [
     "AgentMemoryRuntime",
     "AgentMemoryRuntimeConfig",
     "RuntimeHooks",
+    "AsyncAgentMemoryRuntime",
     "EvidenceSpineSettings",
     "VectorBackend",
     "HashingVectorBackend",

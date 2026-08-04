@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 
 from evidencespine.runtime import AgentMemoryRuntime, RuntimeHooks
 from evidencespine.settings import EvidenceSpineSettings
+from grounding_utils import grounded_item
 
 
-def _runtime(tmp_path: Path, *, hooks: RuntimeHooks | None = None) -> AgentMemoryRuntime:
-    settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"))
+def _runtime(tmp_path: Path, *, hooks: RuntimeHooks | None = None, storage_format: str = "sqlite") -> AgentMemoryRuntime:
+    settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"), storage_format=storage_format)
     return AgentMemoryRuntime(config=settings.to_runtime_config(), hooks=hooks)
 
 
-def _jsonl_rows(path: Path) -> list[dict]:
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return []
-    return [json.loads(line) for line in text.splitlines()]
+def _events(rt: AgentMemoryRuntime) -> list[dict]:
+    return list(rt.store.iter_events())
+
+
+def _facts(rt: AgentMemoryRuntime) -> list[dict]:
+    return list(rt.store.iter_facts())
 
 
 def test_runtime_ingest_brief_handoff_roundtrip_with_evidence_items(tmp_path: Path) -> None:
@@ -50,7 +51,7 @@ def test_runtime_ingest_brief_handoff_roundtrip_with_evidence_items(tmp_path: Pa
     )
     assert out["status"] == "ok"
 
-    facts = _jsonl_rows(tmp_path / ".es" / "facts.jsonl")
+    facts = _facts(rt)
     assert facts[-1]["evidence_items"][0]["source_id"] == "patch.diff"
 
     brief = rt.build_brief("demo", "status")
@@ -126,7 +127,7 @@ def test_runtime_import_handoff_v2_flattens_claim_and_packet_evidence_items(tmp_
     out = rt.import_handoff(packet, source_agent_id="auditor")
     assert out["status"] == "ok"
 
-    events = _jsonl_rows(tmp_path / ".es" / "events.jsonl")
+    events = _events(rt)
     latest = events[-1]
     assert {item["source_id"] for item in latest["evidence_items"]} == {"packet.md", "src/file.py", "notes.md"}
 
@@ -203,12 +204,12 @@ def test_runtime_state_context_propagates_through_brief_and_handoff(tmp_path: Pa
                 "status": "active",
                 "owner_agent_id": "implementer",
             },
-            "evidence_refs": ["src/auth.py#L42-L57"],
+            "evidence_items": [grounded_item(tmp_path)],
         }
     )
     assert out["status"] == "ok"
 
-    facts = _jsonl_rows(tmp_path / ".es" / "facts.jsonl")
+    facts = _facts(rt)
     assert facts[-1]["state_context"]["scope_id"] == "auth-timeout-fix"
 
     brief = rt.build_brief("demo", "what matters")
@@ -252,9 +253,298 @@ def test_runtime_import_handoff_preserves_state_context_via_synthetic_rows(tmp_p
     assert out["status"] == "ok"
     assert out["state_rows_imported"] == 1
 
-    events = _jsonl_rows(tmp_path / ".es" / "events.jsonl")
+    events = _events(rt)
     imported_rows = [row for row in events if row.get("metadata", {}).get("imported_packet_id") == "packet_with_state"]
     assert any(row.get("state_context", {}).get("scope_id") == "release-gate" for row in imported_rows)
+
+
+def test_runtime_import_handoff_preserves_claim_classification(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    out = rt.import_handoff(
+        {
+            "schema_version": "v2",
+            "packet_id": "classified_packet",
+            "role": "auditor",
+            "thread_id": "demo",
+            "scope": "verify",
+            "locked_decisions": ["Locked: ship v0.5 first"],
+            "claims": [
+                {
+                    "claim": "Verified: tests green",
+                    "status": "verified",
+                    "evidence_items": [grounded_item(tmp_path, name="tests/evidence.py")],
+                },
+                {"claim": "Open: concurrency audit", "status": "asserted"},
+            ],
+            "unresolved_contradictions": [
+                {"claim": "CONTRADICTION: timing mismatch", "status": "contradicted"},
+            ],
+            "required_validations": ["re-run suite", "verify packaging"],
+            "checksum": "placeholder",
+        },
+        source_agent_id="auditor",
+    )
+    assert out["status"] == "ok"
+    assert out["decisions_imported"] == 1
+    assert out["claims_imported"] == 2
+    assert out["contradictions_imported"] == 1
+    assert out["validations_imported"] == 2
+
+    b = rt.build_brief("demo", "status").to_dict()
+    assert any(item.startswith("Locked: ship v0.5 first") for item in b["locked_decisions"])
+    assert any(item.startswith("Verified: tests green") for item in b["recent_verified_facts"])
+    assert any(item.startswith("Open: concurrency audit") for item in b["open_items"])
+    assert any("timing mismatch" in item for item in b["active_risks"])
+    assert all(
+        action.startswith(expected)
+        for action, expected in zip(b["next_actions"], ["re-run suite", "verify packaging"])
+    )
+
+
+def test_runtime_import_handoff_binds_to_importer_thread(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    out = rt.import_handoff(
+        {
+            "schema_version": "v2",
+            "packet_id": "handoff_from_demo",
+            "role": "auditor",
+            "thread_id": "demo",
+            "scope": "verify",
+            "locked_decisions": ["Locked: successor owns cleanup"],
+            "claims": [
+                {
+                    "claim": "Verified: handoff received",
+                    "status": "verified",
+                    "evidence_items": [grounded_item(tmp_path, name="packets/evidence.py")],
+                }
+            ],
+            "required_validations": ["continue from demo"],
+            "checksum": "placeholder",
+        },
+        source_agent_id="auditor",
+        thread_id="successor",
+    )
+    assert out["status"] == "ok"
+
+    successor = rt.build_brief("successor", "status").to_dict()
+    assert any(item.startswith("Locked: successor owns cleanup") for item in successor["locked_decisions"])
+    assert any(item.startswith("Verified: handoff received") for item in successor["recent_verified_facts"])
+    assert successor["next_actions"][0].startswith("continue from demo")
+
+    demo = rt.build_brief("demo", "status").to_dict()
+    assert not any(item.startswith("Verified: handoff received") for item in demo["recent_verified_facts"])
+
+    events = _events(rt)
+    imported = [e for e in events if e.get("metadata", {}).get("imported_packet_id") == "handoff_from_demo"]
+    assert imported and all(e["metadata"]["imported_from_thread"] == "demo" for e in imported)
+
+
+def test_runtime_import_handoff_skips_content_duplicates_on_reimport(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    packet = {
+        "schema_version": "v2",
+        "packet_id": "reimported_packet",
+        "role": "researcher",
+        "thread_id": "demo",
+        "scope": "verify",
+        "locked_decisions": ["Locked: ship v0.5 first"],
+        "claims": [
+            {"claim": "Verified: tests green", "status": "verified", "evidence_refs": ["tests/#L1"]},
+            {"claim": "Open: concurrency audit", "status": "asserted"},
+        ],
+        "required_validations": ["re-run suite"],
+        "checksum": "placeholder",
+    }
+    first = rt.import_handoff(packet, source_agent_id="researcher")
+    assert first["status"] == "ok"
+    assert first["decisions_imported"] == 1
+    assert first["claims_imported"] == 2
+
+    second = rt.import_handoff(packet, source_agent_id="researcher")
+    assert second["status"] == "ok"
+    assert second["duplicates_skipped"] == 3
+    assert second["decisions_imported"] == 0
+    assert second["claims_imported"] == 0
+
+    before = len(_facts(rt))
+    rt.import_handoff(packet, source_agent_id="researcher")
+    assert len(_facts(rt)) == before
+
+
+def test_runtime_import_handoff_strips_inline_refs_and_dedupes_against_clean_facts(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "outcome",
+            "role": "researcher",
+            "source_agent_id": "researcher",
+            "source_turn_id": "t1",
+            "payload": {"claim": "import fidelity confirmed live", "fact_state": "verified"},
+            "evidence_refs": ["src/evidencespine/runtime.py"],
+        }
+    )
+    packet = {
+        "schema_version": "v2",
+        "packet_id": "suffixed_packet",
+        "role": "auditor",
+        "thread_id": "demo",
+        "scope": "verify",
+        "locked_decisions": ["Locked: ship v0.5 [ref:src/evidencespine/runtime.py]"],
+        "claims": [
+            {"claim": "import fidelity confirmed live [ref:src/evidencespine/runtime.py]", "status": "verified"},
+            {"claim": "Open: concurrency audit [ref:src/evidencespine/runtime.py] [ref:src/evidencespine/store.py]", "status": "asserted"},
+        ],
+        "required_validations": ["re-run suite"],
+        "checksum": "placeholder",
+    }
+    out = rt.import_handoff(packet, source_agent_id="auditor")
+    assert out["status"] == "ok"
+    assert out["duplicates_skipped"] == 1
+    assert out["claims_imported"] == 1
+
+    facts = _facts(rt)
+    stored = [f["claim"] for f in facts]
+    assert "import fidelity confirmed live" in stored
+    assert not any("[ref:" in claim for claim in stored)
+    locked = [f for f in facts if f["claim"] == "Locked: ship v0.5"]
+    assert locked and locked[0]["state"] == "asserted"
+    assert "src/evidencespine/store.py" in locked[0]["evidence_refs"] or "src/evidencespine/store.py" in {
+        ref for f in facts if f["claim"] == "Open: concurrency audit" for ref in f["evidence_refs"]
+    }
+
+
+def test_runtime_import_handoff_skips_decision_when_verified_fact_exists(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "decision",
+            "role": "implementer",
+            "source_agent_id": "impl",
+            "source_turn_id": "t1",
+            "payload": {"claim": "Locked: ship v0.5 first", "fact_state": "verified"},
+        }
+    )
+    out = rt.import_handoff(
+        {
+            "schema_version": "v2",
+            "packet_id": "p",
+            "role": "auditor",
+            "thread_id": "demo",
+            "scope": "s",
+            "locked_decisions": ["Locked: ship v0.5 first [ref:src/evidencespine/runtime.py]"],
+            "claims": [],
+            "required_validations": [],
+            "checksum": "c",
+        },
+        source_agent_id="auditor",
+    )
+    assert out["duplicates_skipped"] == 1
+    assert out["decisions_imported"] == 0
+    assert sum(1 for f in _facts(rt) if f["claim"] == "Locked: ship v0.5 first") == 1
+
+
+def test_verified_claim_supersedes_asserted_twin(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    first = rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "decision",
+            "role": "implementer",
+            "source_agent_id": "impl",
+            "source_turn_id": "t1",
+            "payload": {"claim": "Open: concurrency audit", "fact_state": "asserted"},
+        }
+    )
+    assert first["status"] == "ok"
+
+    second = rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "outcome",
+            "role": "auditor",
+            "source_agent_id": "auditor",
+            "source_turn_id": "t2",
+            "payload": {"claim": "Open: concurrency audit", "fact_state": "verified"},
+            "evidence_items": [grounded_item(tmp_path, name="audit/evidence.py")],
+        }
+    )
+    assert second["status"] == "ok"
+
+    facts = _facts(rt)
+    asserted = [f for f in facts if f["state"] == "asserted" and f["claim"] == "Open: concurrency audit"]
+    verified = [f for f in facts if f["state"] == "verified" and f["claim"] == "Open: concurrency audit"]
+    assert asserted and verified, "both rows exist; the verified twin supersedes the asserted one"
+    assert verified[0]["supersedes_fact_id"] == asserted[0]["fact_id"], "verified fact must supersede the asserted twin"
+
+    b = rt.build_brief("demo", "status").to_dict()
+    assert any(item.startswith("Open: concurrency audit") for item in b["recent_verified_facts"])
+    assert not any(item.startswith("Open: concurrency audit") for item in b["open_items"])
+
+
+def test_brief_excludes_superseded_facts_and_dedupes_sections(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "decision",
+            "role": "implementer",
+            "source_agent_id": "impl",
+            "source_turn_id": "t1",
+            "payload": {"claim": "Deferred: revisit later", "fact_state": "asserted"},
+        }
+    )
+    old = [f for f in _facts(rt) if f["claim"] == "Deferred: revisit later"][0]
+    rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "outcome",
+            "role": "auditor",
+            "source_agent_id": "auditor",
+            "source_turn_id": "t3",
+            "payload": {
+                "claim": "Deferred: revisit later",
+                "fact_state": "verified",
+                "supersedes_ref": old["fact_id"],
+            },
+            "evidence_items": [grounded_item(tmp_path, name="deferred/evidence.py")],
+        }
+    )
+
+    b = rt.build_brief("demo", "status").to_dict()
+    assert not any(item.startswith("Deferred: revisit later") for item in b["open_items"])
+    assert not any(item.startswith("Deferred: revisit later") for item in b["locked_decisions"])
+
+    dup_a = rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "reflection",
+            "role": "auditor",
+            "source_agent_id": "auditor",
+            "source_turn_id": "t4",
+            "payload": {"claim": "Dup note", "fact_state": "asserted"},
+            "evidence_refs": ["a.py"],
+        }
+    )
+    assert dup_a["status"] == "ok"
+    dup_b = rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "reflection",
+            "role": "auditor",
+            "source_agent_id": "auditor",
+            "source_turn_id": "t5",
+            "payload": {"claim": "Dup note", "fact_state": "asserted"},
+            "evidence_refs": ["b.py"],
+        }
+    )
+    assert dup_b["status"] == "ok"
+
+    b2 = rt.build_brief("demo", "status").to_dict()
+    assert sum(1 for item in b2["open_items"] if item.startswith("Dup note")) == 1, (
+        "identical claims must be deduped in the brief"
+    )
 
 
 def test_query_view_resolves_latest_scope_state_and_filters(tmp_path: Path) -> None:
@@ -376,13 +666,48 @@ def test_query_view_detects_stale_and_conflicting_rows(tmp_path: Path) -> None:
     stale = rt.query_view("stale_claims", thread_id="demo", include_closed=True).to_dict()
     assert any(row["scope_id"] == "runtime-health" and row["freshness_state"] == "stale" for row in stale["rows"])
 
+    scopes = rt.query_view("active_scopes", thread_id="demo", include_closed=True).to_dict()
+    shared = [row for row in scopes["rows"] if row["scope_id"] == "shared-scope"]
+    assert shared, "shared-scope must resolve"
+    assert shared[0]["multi_owner"] is True, "different owners alone is coordination, not conflict"
+    assert shared[0]["conflict"] is False, "same status/kind with different owners is not conflict"
+
     contradictions = rt.query_view("contradictions", thread_id="demo", include_closed=True).to_dict()
-    assert any(row["scope_id"] == "shared-scope" and row["conflict"] is True for row in contradictions["rows"])
+    assert not any(row["scope_id"] == "shared-scope" for row in contradictions["rows"]), (
+        "multi-owner coordination must not surface in the contradictions view"
+    )
 
     snap = rt.snapshot()
     assert snap["agent_active_scope_count_24h"] >= 1
     assert snap["agent_active_scope_stale_rate_24h"] >= 0.0
-    assert snap["agent_scope_conflict_rate_24h"] >= 0.0
+    assert snap["agent_scope_conflict_rate_24h"] < 1.0, "multi-owner scope must not count as conflict"
+
+
+def test_query_view_flags_status_disagreement_within_state_kind_as_conflict(tmp_path: Path) -> None:
+    rt = _runtime(tmp_path)
+    for status, owner, turn in (("ready", "auditor", "g1"), ("blocked", "operator", "g2")):
+        rt.ingest_event(
+            {
+                "thread_id": "demo",
+                "event_type": "reflection",
+                "role": owner,
+                "source_agent_id": owner,
+                "source_turn_id": turn,
+                "payload": {"claim": f"Gate says {status}", "fact_state": "asserted"},
+                "state_context": {
+                    "scope_id": "release-gate",
+                    "state_kind": "pending_gate",
+                    "status": status,
+                    "owner_agent_id": owner,
+                    "fresh_until": "2099-01-01T00:00:00Z",
+                },
+            }
+        )
+
+    view = rt.query_view("contradictions", thread_id="demo", include_closed=True).to_dict()
+    gate = [row for row in view["rows"] if row["scope_id"] == "release-gate"]
+    assert gate and gate[0]["conflict"] is True, "ready vs blocked on the same gate is a real conflict"
+    assert gate[0]["multi_owner"] is True
 
 
 def test_reconcile_returns_unsupported_without_hook(tmp_path: Path) -> None:

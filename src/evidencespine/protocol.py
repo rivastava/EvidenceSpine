@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, overload
 
 
 EVENT_LIFECYCLE = ("intent", "decision", "action", "outcome", "reflection")
@@ -248,6 +249,47 @@ def evidence_item_to_ref(item: Any) -> str:
     return source_id
 
 
+def normalize_verification(value: Any) -> Dict[str, Any]:
+    """Normalize a verification claim: {method, reference, verified_at, verified_by}."""
+    if not isinstance(value, dict):
+        return {}
+    method = safe_text(value.get("method"), "", 32).lower()
+    reference = safe_text(value.get("reference"), "", 512)
+    if method not in {"test", "gate", "tool", "manual"} or not reference:
+        return {}
+    return {
+        "method": method,
+        "reference": reference,
+        "verified_at": safe_text(value.get("verified_at") or utc_now_iso(), utc_now_iso(), 64),
+        "verified_by": safe_text(value.get("verified_by"), "unknown", 128),
+    }
+
+
+def is_grounded_claim(evidence_items: Any, verification: Any = None) -> bool:
+    """A claim is grounded when it carries a checksummed excerpt OR a
+    verification method with a concrete reference (test/gate/tool/manual)."""
+    for item in normalize_evidence_items(evidence_items):
+        if evidence_item_excerpt_matches_checksum(item):
+            return True
+    verified = normalize_verification(verification)
+    return bool(verified.get("method") and verified.get("reference"))
+
+
+def strip_inline_refs(text: str) -> Tuple[str, List[str]]:
+    """Remove trailing ``[ref:...]`` citation suffixes embedded in claim text.
+
+    Emitted handoff packets carry claims whose text already includes the
+    ``[ref:...]`` suffix appended by brief rendering. On import those suffixes
+    must be extracted back into structured evidence refs so the stored claim
+    matches the original clean text (and dedupe keys align).
+    """
+    raw = safe_text(text, "", 4096)
+    pattern = re.compile(r"\[ref:([^\]]+)\]")
+    refs = [m.group(1).strip() for m in pattern.finditer(raw) if m.group(1).strip()]
+    clean = pattern.sub("", raw).strip()
+    return clean, refs
+
+
 def merge_evidence_refs(refs: Any, evidence_items: Any = None) -> List[str]:
     merged = list(normalize_refs(refs))
     for item in normalize_evidence_items(evidence_items):
@@ -467,6 +509,7 @@ class ControlViewRow:
     lease_state: str = "none"
     has_contradiction: bool = False
     conflict: bool = False
+    multi_owner: bool = False
     evidence_refs: List[str] = field(default_factory=list)
     evidence_items: List[Dict[str, Any]] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -491,6 +534,7 @@ class ControlViewRow:
             "lease_state": safe_text(self.lease_state, "none", 16),
             "has_contradiction": bool(self.has_contradiction),
             "conflict": bool(self.conflict),
+            "multi_owner": bool(self.multi_owner),
             "evidence_refs": merge_evidence_refs(self.evidence_refs, self.evidence_items),
             "evidence_items": normalize_evidence_items(self.evidence_items),
             "metadata": dict(self.metadata or {}),
@@ -576,7 +620,13 @@ class ClaimCitation(Sequence[str]):
     def __len__(self) -> int:
         return len(self.evidence_refs)
 
-    def __getitem__(self, index: int) -> str:
+    @overload
+    def __getitem__(self, index: int) -> str: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[str]: ...
+
+    def __getitem__(self, index: int | slice) -> str | Sequence[str]:
         return self.evidence_refs[index]
 
     def primary_evidence_item(self) -> Dict[str, Any] | None:
@@ -670,7 +720,7 @@ class AgentMemoryEvent:
     def to_dict(self) -> Dict[str, Any]:
         evidence_items = normalize_evidence_items(self.evidence_items)
         evidence_refs = merge_evidence_refs(self.evidence_refs, evidence_items)
-        payload = {
+        payload: Dict[str, Any] = {
             "schema_version": "v2",
             "event_id": safe_text(self.event_id, "", 128),
             "thread_id": safe_text(self.thread_id, "", 128),
@@ -993,6 +1043,10 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     state = safe_text(payload.get("fact_state"), "asserted", 32).lower()
     if state not in FACT_STATES:
         state = "asserted"
+    supersedes = safe_text(
+        payload.get("supersedes_ref") or event.get("supersedes_fact_id"), "", 128
+    )
+    verification = normalize_verification(payload.get("verification") or event.get("verification"))
 
     dedup: Dict[str, Dict[str, Any]] = {}
     for claim in claims:
@@ -1010,9 +1064,11 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
             "evidence_items": list(evidence_items),
             "confidence": safe_float(payload.get("confidence", event.get("confidence", 0.5)), 0.5, 0.0, 1.0),
             "tags": [safe_text(x, "", 64) for x in list(payload.get("tags", []) or []) if safe_text(x, "", 64)],
+            "supersedes_fact_id": supersedes,
             "metadata": {
                 "event_id": safe_text(event.get("event_id"), "", 128),
                 "event_type": safe_text(event.get("event_type"), "reflection", 64).lower(),
+                **({"verification": dict(verification)} if verification else {}),
             },
         }
         if state_context is not None:

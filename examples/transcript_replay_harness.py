@@ -15,6 +15,9 @@ def main() -> int:
         return 2
 
     fixture_path = Path(sys.argv[1]).resolve()
+    if not fixture_path.exists():
+        print(f"error: fixture not found: {fixture_path}")
+        return 2
     payload = json.loads(fixture_path.read_text(encoding="utf-8"))
     with tempfile.TemporaryDirectory(prefix="evidencespine_replay_") as tmp:
         settings = EvidenceSpineSettings.from_env(base_dir=str(Path(tmp) / ".evidencespine"))

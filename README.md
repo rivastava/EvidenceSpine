@@ -18,6 +18,14 @@ It provides:
 - Optional governance hooks for contradiction checks and external reconciliation
 - Hybrid retrieval mode (`lexical|hybrid|vector`) with pluggable vector backend
 - Transcript-first adapters for plain `messages[]`, with LangGraph and AutoGen wrappers built on top
+- Realtime multi-agent debate chat (`evidencespine chat`): one polling loop per role over the spine as a live message bus, with enforced reply caps, rolling context windows with auto-summary, duration caps, and an optional facilitator pump (tested on opencode)
+- Supersede-on-fix: verified claims auto-supersede asserted twins; resolved items stop surfacing as locked decisions
+- Owner-conflict vs claim-contradiction split in derived views (`multi_owner` vs `conflict`)
+- Span grounding first-class: `evidencespine ground` turns `file:line` refs into checksummed excerpt evidence items
+- Verified-requires-span policy: `verified` facts must carry a checksummed excerpt or verification provenance, else they are stored as `asserted`
+- Drift-checker (`evidencespine drift-check`): re-verifies checksummed evidence against live files and flags stale facts (view + brief + metric)
+- Verification provenance (`verify` / `verify_fact`): records *how* a claim was verified (test/gate/tool/manual), superseding the raw fact
+- Thin git/test hooks (`harness git`): post-commit/post-merge span ingestion and test-result provenance with zero agent effort
 
 ## Why this exists
 Most agent-memory systems store context. EvidenceSpine adds strict claim quality controls:
@@ -29,11 +37,24 @@ Most agent-memory systems store context. EvidenceSpine adds strict claim quality
 ## Install
 
 ```bash
-cd oss/evidencespine
+cd evidencespine
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
+
+## Supported harnesses
+
+Install-time harness delivery (`evidencespine harness install --harness <x>`):
+`opencode`, `claude-code`, `cursor`, `git` (commit/test hooks), or `all`.
+
+The MCP server is harness-agnostic — any MCP-capable agent (opencode, Cursor,
+Claude Code, Codex CLI/IDE/desktop, generic MCP apps) gets the same tools and
+resources. Codex guidance arrives via the committed `AGENTS.md` (read by
+opencode, Codex, Cursor, and Claude Code alike) plus manual MCP registration —
+see `docs/CODEX.md` for the full Codex integration spec. A2A, the async
+runtime, the CLI, and framework adapters (TranscriptAdapter, LangGraph,
+AutoGen) are additional harness-agnostic channels.
 
 ## Quick start
 
@@ -168,7 +189,7 @@ See:
 Run benchmark harness:
 
 ```bash
-cd oss/evidencespine
+cd evidencespine
 PYTHONPATH=src python benchmarks/bench_evidencespine.py \
   --events 2000 \
   --brief-queries 100 \
@@ -179,7 +200,7 @@ PYTHONPATH=src python benchmarks/bench_evidencespine.py \
 Apples-to-apples comparison:
 
 ```bash
-cd oss/evidencespine
+cd evidencespine
 PYTHONPATH=src python benchmarks/apples_to_apples_compare.py \
   --events 1200 \
   --queries 80 \

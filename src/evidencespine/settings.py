@@ -39,6 +39,7 @@ def _env_float(name: str, default: float, minimum: float) -> float:
 @dataclass
 class EvidenceSpineSettings:
     base_dir: str = ".evidencespine"
+    storage_format: str = "sqlite"
     enabled: bool = True
     fail_open: bool = True
     max_event_tail: int = 4000
@@ -49,18 +50,25 @@ class EvidenceSpineSettings:
     brief_top_k_facts: int = 24
     brief_recency_half_life_hours: float = 8.0
     control_view_lookback_hours: float = 168.0
+    verified_requires_span: bool = True
     retrieval_mode: str = "lexical"
     retrieval_lexical_weight: float = 1.0
     retrieval_vector_weight: float = 0.35
+    embedding_backend: str = "auto"  # auto | hashing | fastembed
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
 
     @classmethod
-    def from_env(cls, *, base_dir: str | None = None) -> "EvidenceSpineSettings":
+    def from_env(cls, *, base_dir: str | None = None, storage_format: str | None = None) -> "EvidenceSpineSettings":
         effective_base = base_dir or os.getenv("EVIDENCESPINE_BASE_DIR", ".evidencespine")
+        effective_format = str(storage_format or os.getenv("EVIDENCESPINE_STORAGE_FORMAT", "sqlite")).strip().lower()
+        if effective_format not in {"sqlite", "jsonl"}:
+            effective_format = "sqlite"
         retrieval_mode = str(os.getenv("EVIDENCESPINE_RETRIEVAL_MODE", "lexical")).strip().lower()
         if retrieval_mode not in {"lexical", "hybrid", "vector"}:
             retrieval_mode = "lexical"
         return cls(
             base_dir=str(effective_base),
+            storage_format=str(effective_format),
             enabled=_env_bool("EVIDENCESPINE_ENABLE", True),
             fail_open=_env_bool("EVIDENCESPINE_FAIL_OPEN", True),
             max_event_tail=_env_int("EVIDENCESPINE_MAX_EVENT_TAIL", 4000, 100),
@@ -71,10 +79,13 @@ class EvidenceSpineSettings:
             brief_top_k_facts=_env_int("EVIDENCESPINE_BRIEF_TOP_K_FACTS", 24, 1),
             brief_recency_half_life_hours=_env_float("EVIDENCESPINE_BRIEF_RECENCY_HALF_LIFE_HOURS", 8.0, 0.25),
             control_view_lookback_hours=_env_float("EVIDENCESPINE_CONTROL_VIEW_LOOKBACK_HOURS", 168.0, 1.0),
-            retrieval_mode=retrieval_mode,
-            retrieval_lexical_weight=_env_float("EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT", 1.0, 0.0),
-            retrieval_vector_weight=_env_float("EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT", 0.35, 0.0),
-        )
+            verified_requires_span=_env_bool("EVIDENCESPINE_VERIFIED_REQUIRES_SPAN", True),
+        retrieval_mode=retrieval_mode,
+        retrieval_lexical_weight=_env_float("EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT", 1.0, 0.0),
+        retrieval_vector_weight=_env_float("EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT", 0.35, 0.0),
+        embedding_backend=str(os.getenv("EVIDENCESPINE_EMBEDDING_BACKEND", "auto")).strip().lower(),
+        embedding_model=str(os.getenv("EVIDENCESPINE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")).strip(),
+    )
 
     def to_runtime_config(self) -> AgentMemoryRuntimeConfig:
         base = Path(self.base_dir)
@@ -84,6 +95,8 @@ class EvidenceSpineSettings:
             max_event_tail=int(self.max_event_tail),
             redaction_enable=bool(self.redaction_enable),
             dedupe_window_sec=float(self.dedupe_window_sec),
+            storage_format=str(self.storage_format),
+            db_path=str(base / "evidencespine.db"),
             events_path=str(base / "events.jsonl"),
             facts_path=str(base / "facts.jsonl"),
             state_path=str(base / "state.json"),
@@ -94,7 +107,10 @@ class EvidenceSpineSettings:
             brief_top_k_facts=int(self.brief_top_k_facts),
             brief_recency_half_life_hours=float(self.brief_recency_half_life_hours),
             control_view_lookback_hours=float(self.control_view_lookback_hours),
+            verified_requires_span=bool(self.verified_requires_span),
             retrieval_mode=str(self.retrieval_mode),
             retrieval_lexical_weight=float(self.retrieval_lexical_weight),
             retrieval_vector_weight=float(self.retrieval_vector_weight),
+            embedding_backend=str(self.embedding_backend),
+            embedding_model=str(self.embedding_model),
         )
