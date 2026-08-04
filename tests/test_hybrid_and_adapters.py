@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import pytest
@@ -133,7 +134,8 @@ def test_existing_public_adapter_methods_still_exist(tmp_path: Path) -> None:
     assert callable(ag.handoff)
 
 
-def test_embedding_backend_auto_falls_back_to_hashing(tmp_path: Path) -> None:
+def test_embedding_backend_auto_falls_back_to_hashing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "fastembed", None)
     settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"))
     settings.retrieval_mode = "hybrid"
     settings.embedding_backend = "auto"
@@ -152,7 +154,8 @@ def test_embedding_backend_auto_falls_back_to_hashing(tmp_path: Path) -> None:
     assert brief["recent_verified_facts"] or brief["locked_decisions"]
 
 
-def test_embedding_backend_fastembed_requires_extra(tmp_path: Path) -> None:
+def test_embedding_backend_fastembed_requires_extra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "fastembed", None)
     settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"))
     settings.retrieval_mode = "hybrid"
     settings.embedding_backend = "fastembed"
