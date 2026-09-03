@@ -33,6 +33,11 @@ All notable changes to this project will be documented in this file.
 - Cursor hook stdin resolves `conversation_id` for thread identity.
 
 ### Fixed
+- Excerpts are byte-exact through normalization: spans starting on indented or
+  blank lines (or ending on blank lines) now verify instead of being silently
+  downgraded; whitespace-only spans are rejected as ungroundable at ground time.
+- Same-turn verified twins stay visible in briefs: newest row wins per fact id
+  and self-references no longer hide the twin alongside the original.
 - Claude Code delivery passes `claude plugin validate`: list-shape hooks with
   matcher/timeout, `SessionEnd` instead of per-turn `Stop`, `hooks/hooks.json` at
   the plugin root with a `plugin.json` pointer, `shlex.join` quoting, the

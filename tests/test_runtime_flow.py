@@ -483,6 +483,43 @@ def test_verified_claim_supersedes_asserted_twin(tmp_path: Path) -> None:
     assert not any(item.startswith("Open: concurrency audit") for item in b["open_items"])
 
 
+def test_verified_twin_same_turn_stays_visible_in_brief(tmp_path: Path) -> None:
+    """Same claim + same turn (auto-supersede twin) shares the twin's fact id;
+    the brief must show the newest (verified) row, not hide both."""
+    from evidencespine.grounding import ground_file
+
+    rt = _runtime(tmp_path)
+    (tmp_path / "ev.py").write_text("x = 1\n", encoding="utf-8")
+    rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "decision",
+            "role": "implementer",
+            "source_agent_id": "impl",
+            "source_turn_id": "t1",
+            "payload": {"claim": "Same-turn twin", "fact_state": "asserted"},
+        }
+    )
+    item = ground_file("ev.py", 1, 1, source_root=str(tmp_path))
+    assert item is not None
+    out = rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "outcome",
+            "role": "auditor",
+            "source_agent_id": "auditor",
+            "source_turn_id": "t1",
+            "payload": {"claim": "Same-turn twin", "fact_state": "verified"},
+            "evidence_items": [item],
+        }
+    )
+    assert out["status"] == "ok"
+    assert not out.get("policy_downgrades")
+    b = rt.build_brief("demo", "status").to_dict()
+    assert any(item.startswith("Same-turn twin") for item in b["recent_verified_facts"])
+    assert not any(item.startswith("Same-turn twin") for item in b["open_items"])
+
+
 def test_brief_excludes_superseded_facts_and_dedupes_sections(tmp_path: Path) -> None:
     rt = _runtime(tmp_path)
     rt.ingest_event(

@@ -103,6 +103,19 @@ def _dedupe_preserve_order(values: Sequence[str]) -> List[str]:
     return list(dict.fromkeys([safe_text(x, "", 512) for x in values if safe_text(x, "", 512)]))
 
 
+def exact_excerpt(value: Any, limit: int = 4096) -> str:
+    """Coerce an evidence excerpt preserving exact bytes (no strip/truncate of content).
+
+    Checksums bind claims to byte-exact file text, so normalization must not
+    strip leading/trailing whitespace: a span starting on an indented or blank
+    line would otherwise never verify. Only the length cap applies.
+    """
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    return text[: max(0, int(limit))]
+
+
 @dataclass(frozen=True)
 class EvidenceItem:
     source_id: str
@@ -137,7 +150,7 @@ class EvidenceItem:
             payload["char_start"] = char_start
             payload["char_end"] = max(char_start, char_end if char_end is not None else char_start)
 
-        excerpt = safe_text(self.excerpt, "", 4096)
+        excerpt = exact_excerpt(self.excerpt, 4096)
         if excerpt:
             payload["excerpt"] = excerpt
 
@@ -170,7 +183,7 @@ def _normalize_evidence_item(value: Any) -> Dict[str, Any]:
         char_end=safe_int(value.get("char_end"), None, 0, None),
         line_start=safe_int(value.get("line_start"), None, 1, None),
         line_end=safe_int(value.get("line_end"), None, 1, None),
-        excerpt=safe_text(value.get("excerpt"), "", 4096),
+        excerpt=exact_excerpt(value.get("excerpt"), 4096),
         checksum=safe_text(value.get("checksum"), "", 256),
         confidence=(value.get("confidence") if value.get("confidence") is not None else None),
         verification_state=safe_text(value.get("verification_state"), "", 32).lower(),
@@ -309,7 +322,7 @@ def has_grounded_span(evidence_items: Any) -> bool:
 
 def evidence_item_excerpt_matches_checksum(item: Any) -> bool:
     payload = _normalize_evidence_item(item)
-    excerpt = safe_text(payload.get("excerpt"), "", 4096)
+    excerpt = exact_excerpt(payload.get("excerpt"), 4096)
     checksum = safe_text(payload.get("checksum"), "", 256).lower()
     if not excerpt or not checksum:
         return False

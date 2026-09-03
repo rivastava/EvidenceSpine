@@ -187,3 +187,39 @@ def test_verify_fact_missing_and_invalid(tmp_path: Path) -> None:
     assert rt.verify_fact(target, method="bogus", reference="x")["status"] == "invalid"
     assert rt.verify_fact(target, method="manual", reference="")["status"] == "invalid"
     rt.store.close()
+
+
+def test_grounded_span_with_boundary_whitespace_stays_verified(tmp_path: Path) -> None:
+    """Spans touching blank/indented boundary lines must verify: excerpts are
+    byte-exact artifacts and normalization must not strip them."""
+    from evidencespine.protocol import evidence_item_excerpt_matches_checksum
+
+    src = tmp_path / "w.py"
+    src.write_text("\n    indented = 1\n    body = 2\n\n", encoding="utf-8")
+    for ref in ("w.py#L1-L3", "w.py#L2-L3", "w.py#L2-L4"):
+        item = ground_ref(ref, source_root=str(tmp_path))
+        assert item is not None, ref
+        assert evidence_item_excerpt_matches_checksum(item), ref
+    rt = _runtime(tmp_path)
+    out = rt.ingest_event(
+        {
+            "thread_id": "demo",
+            "event_type": "outcome",
+            "role": "auditor",
+            "source_agent_id": "auditor",
+            "source_turn_id": "t1",
+            "payload": {"claim": "Boundary whitespace span verified", "fact_state": "verified"},
+            "evidence_items": [ground_ref("w.py#L1-L4", source_root=str(tmp_path))],
+        }
+    )
+    assert out["status"] == "ok"
+    assert not out.get("policy_downgrades")
+    facts = list(rt.store.iter_facts())
+    assert facts and facts[0]["state"] == "verified"
+    rt.store.close()
+
+
+def test_ground_ref_rejects_whitespace_only_span(tmp_path: Path) -> None:
+    (tmp_path / "blank.py").write_text("real = 1\n\n\n", encoding="utf-8")
+    assert ground_ref("blank.py#L2-L3", source_root=str(tmp_path)) is None
+    assert ground_ref("blank.py#L1-L1", source_root=str(tmp_path)) is not None

@@ -92,6 +92,9 @@ def ground_file(
     if lines is None or not lines:
         return None
     excerpt = "\n".join(lines)
+    if not excerpt.strip():
+        # A whitespace-only span carries no checkable evidence.
+        return None
     return {
         "source_id": path,
         "line_start": int(line_start),

@@ -510,10 +510,25 @@ class AgentMemoryRuntime:
                 max_items=max(64, int(self.config.brief_top_k_facts) * 6),
                 lookback_hours=lookback_hours,
             )
+            # Same identity (thread, claim, turn) may appear twice when a
+            # verified twin shares its source turn with the asserted original.
+            # Newest row wins; a self-reference (twin superseding its own id)
+            # retires the older state, never the twin itself.
+            latest_by_id: Dict[str, Dict[str, Any]] = {}
+            for idx, fact in enumerate(facts):
+                fid = safe_text(fact.get("fact_id"), "", 128) or f"__noid_{idx}"
+                prev = latest_by_id.get(fid)
+                if prev is None or (parse_ts_value(fact.get("ts_utc")) or 0.0) >= (
+                    parse_ts_value(prev.get("ts_utc")) or 0.0
+                ):
+                    latest_by_id[fid] = fact
+            facts = list(latest_by_id.values())
             superseded_ids = {
                 safe_text(fact.get("supersedes_fact_id"), "", 128)
                 for fact in facts
                 if safe_text(fact.get("supersedes_fact_id"), "", 128)
+                and safe_text(fact.get("supersedes_fact_id"), "", 128)
+                != safe_text(fact.get("fact_id"), "", 128)
             }
             superseded_claim_keys: set[str] = set()
             if superseded_ids:
