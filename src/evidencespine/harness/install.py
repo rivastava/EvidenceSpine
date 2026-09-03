@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from evidencespine.harness.hooks import build_runtime
+from evidencespine import __version__ as _package_version
 
 
 def resolve_executable() -> str:
@@ -389,6 +390,7 @@ def debug_harness(
         return {
             "status": "ok",
             "base_dir": base_dir,
+            "evidencespine_version": str(_package_version or ""),
             "storage_format": runtime.config.storage_format,
             "events_total": int(snapshot.get("events_total", 0)),
             "facts_total": int(snapshot.get("facts_total", 0)),

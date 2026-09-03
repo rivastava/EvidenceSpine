@@ -97,6 +97,27 @@ def test_tool_ingest_brief_view_handoff_snapshot_flow(tmp_path: Path) -> None:
     _run(go())
 
 
+def test_snapshot_reports_running_process_version(tmp_path: Path) -> None:
+    """The snapshot must carry the serving process's own package version so
+    agents can detect a stale long-lived MCP server after an upgrade."""
+    import evidencespine
+    from evidencespine.runtime import AgentMemoryRuntime
+    from evidencespine.settings import EvidenceSpineSettings
+
+    server = _server(tmp_path)
+
+    async def go() -> None:
+        result = await server.call_tool("snapshot", {})
+        assert f'"evidencespine_version": "{evidencespine.__version__}"' in result.content[0].text
+
+    _run(go())
+
+    settings = EvidenceSpineSettings.from_env(base_dir=str(tmp_path / ".es"))
+    rt = AgentMemoryRuntime(config=settings.to_runtime_config())
+    assert rt.snapshot()["evidencespine_version"] == evidencespine.__version__
+    rt.store.close()
+
+
 def test_tool_import_handoff_roundtrip(tmp_path: Path) -> None:
     server = _server(tmp_path)
 
@@ -228,3 +249,67 @@ def test_prompts_treat_placeholder_args_as_unset(tmp_path: Path) -> None:
         assert not any(n.startswith("$") for n in names), "placeholder args must not leak into brief names"
 
     _run(go())
+
+
+def test_live_stdio_server_snapshot_reports_version(tmp_path: Path) -> None:
+    """Spawn the real `evidencespine mcp` stdio server and call snapshot over
+    JSON-RPC: the served version must match this process's package version, so
+    agents can detect a stale long-lived server after an upgrade."""
+    import json
+    import os
+    import queue
+    import subprocess
+    import sys
+    import threading
+
+    import evidencespine
+
+    src_root = str(Path(__file__).resolve().parent.parent / "src")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "evidencespine.cli", "mcp", "--base-dir", str(tmp_path / ".es")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    lines: queue.Queue = queue.Queue()
+
+    def _drain() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if line.strip():
+                lines.put(line.strip())
+
+    threading.Thread(target=_drain, daemon=True).start()
+    try:
+
+        def _rpc(method: str, params: dict | None = None, mid: int = 1) -> dict:
+            msg: dict = {"jsonrpc": "2.0", "id": mid, "method": method}
+            if params is not None:
+                msg["params"] = params
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+            return json.loads(lines.get(timeout=60))
+
+        init = _rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "evidencespine-test", "version": "0"},
+            },
+        )
+        assert init["result"]["serverInfo"]["name"] == "evidencespine"
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.flush()
+        snap = _rpc("tools/call", {"name": "snapshot", "arguments": {}}, mid=2)
+        payload = json.loads(snap["result"]["content"][0]["text"])
+        assert payload["evidencespine_version"] == evidencespine.__version__
+    finally:
+        proc.kill()

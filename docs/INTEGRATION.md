@@ -220,6 +220,12 @@ Tools: `ingest_event`, `build_brief`, `query_view`, `emit_handoff`,
 `import_handoff`, `ground`, `check_drift`, `verify_fact`, `reconcile`,
 `snapshot`, `prune` (11 tools; server also advertises the usage-guide
 `instructions` primer for Codex/GUI discovery).
+
+Restart the MCP server after upgrading EvidenceSpine: hook commands spawn a
+fresh process per call, but a long-lived MCP server (stdio daemon,
+streamable-http) keeps serving the code it started with. `snapshot` reports
+`evidencespine_version` from the serving process; compare it against a fresh
+`harness debug` (which reports the installed version) and restart on mismatch.
 Resources: `evidencespine://brief/{thread_id}`, `evidencespine://view/{view}`,
 `evidencespine://state/{scope_id}`, `evidencespine://snapshot`.
 Prompts: `session_start`, `handoff_receive`, `handoff_send`.

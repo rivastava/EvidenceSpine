@@ -175,6 +175,17 @@ def _control_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _package_version() -> str:
+    """Report the running process's package version (lazy: avoids a cycle,
+    since this module is imported by the package ``__init__``)."""
+    try:
+        from evidencespine import __version__
+
+        return str(__version__ or "")
+    except Exception:
+        return ""
+
+
 class AgentMemoryRuntime:
     def __init__(
         self,
@@ -1157,6 +1168,7 @@ class AgentMemoryRuntime:
 
         return {
             "enabled": bool(self.config.enabled),
+            "evidencespine_version": _package_version(),
             "events_total": int(max(0, int(self.store.state.get("events_total", 0)))),
             "facts_total": int(max(0, int(self.store.state.get("facts_total", 0)))),
             "agent_memory_events_24h": int(len(events)),

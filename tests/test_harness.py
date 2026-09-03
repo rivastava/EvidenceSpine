@@ -274,3 +274,6 @@ def test_debug_harness_reports_health(tmp_path: Path) -> None:
     assert payload["status"] == "ok"
     assert payload["events_total"] >= 1
     assert payload["brief_ok"] is True
+    from evidencespine import __version__
+
+    assert payload["evidencespine_version"] == __version__

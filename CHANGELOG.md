@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `snapshot` and `harness debug` report `evidencespine_version` from the serving
+  process, so agents can detect a stale long-lived MCP server after an upgrade
+  (restart the server on mismatch; hook commands are always fresh processes).
 - Codex harness: `harness install --harness codex` writes `.codex/config.toml`
   (`[mcp_servers.evidencespine]`, `[features] hooks=true`) and `.codex/hooks.json`
   (SessionStart/SessionEnd/PreCompact), plus `harness codex
