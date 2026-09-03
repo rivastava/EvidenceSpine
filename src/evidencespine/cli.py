@@ -431,10 +431,10 @@ def _cmd_harness(args: argparse.Namespace) -> int:
                 import json as _json
 
                 try:
-                    payload = _json.loads(note) if note.strip().startswith("{") else None
+                    envelope = _json.loads(note) if note.strip().startswith("{") else None
                 except Exception:
-                    payload = None
-                if not isinstance(payload, dict) or "hookSpecificOutput" not in payload:
+                    envelope = None
+                if not isinstance(envelope, dict) or "hookSpecificOutput" not in envelope:
                     from evidencespine.harness.claude_code import precompact_envelope as _env
 
                     note = _env(note)
