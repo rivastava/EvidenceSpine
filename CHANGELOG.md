@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Codex harness: `harness install --harness codex` writes `.codex/config.toml`
+  (`[mcp_servers.evidencespine]`, `[features] hooks=true`) and `.codex/hooks.json`
+  (SessionStart/SessionEnd/PreCompact), plus `harness codex
+  session-start|session-stop|precompact` provider actions reusing the shared handlers.
+- Cursor harness: merge-preserving `.cursor/mcp.json` (multi-token executable split),
+  `.cursor/rules/evidencespine.mdc` (alwaysApply), `.cursor/permissions.json`
+  allowlist, and `.cursor/hooks.json` (schema `version: 1`).
+- VSCode harness: `harness install --harness vscode` merges `.vscode/mcp.json`
+  (`servers` key).
+- `agents-md` installer: writes `AGENTS.md` from the canonical guide when missing.
+- Claude Code `.mcp.json` registration (plugin root, non-destructive merge) so CLI,
+  IDE, and Desktop share one MCP config.
+- Opencode `tool.execute.after` auto-capture for edit/write.
+- MCP `instructions` primer for Codex/GUI discovery.
+- `debug` reports `executable_ok`, `mcp_available`, and `grounding_ok`.
+
+### Changed
+- `harness install --harness` accepts
+  `claude-code|opencode|cursor|vscode|codex|git|agents-md|all`; `all` covers every
+  harness plus best-effort git hooks.
+- Opencode plugin uses per-session `--thread-id`, a `briefFor` memo (no shared
+  warmup cross-talk), and `session.created/idle/deleted` lifecycle handling.
+- Git hook template passes `--repo-dir $(git rev-parse --show-toplevel)` and
+  absolutizes `--base-dir` so hooks do not depend on hook-process CWD.
+- `check_drift` defaults to the confined grounding root.
+- Cursor hook stdin resolves `conversation_id` for thread identity.
+
+### Fixed
+- Claude Code delivery passes `claude plugin validate`: list-shape hooks with
+  matcher/timeout, `SessionEnd` instead of per-turn `Stop`, `hooks/hooks.json` at
+  the plugin root with a `plugin.json` pointer, `shlex.join` quoting, the
+  PreCompact JSON envelope, and the `author` object per the manifest schema.
+- Opencode fail-open resolves to empty (logged, never cached as a brief) instead
+  of poisoning system context.
+- `EVIDENCESPINE_AUTO_HANDOFF` env is honored by `handle_session_stop`; the empty
+  `[""]` next-action entry is gone.
+- Git hooks install non-destructively (sentinel + backup + chain, idempotent,
+  worktree-aware) and propagate the inner status instead of masking failures.
+- `install --harness git` outside a repo no longer reports a false `ok`.
+
 ## [0.5.0] - 2026-08-04
 
 ### Added

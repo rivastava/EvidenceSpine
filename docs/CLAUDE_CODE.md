@@ -35,6 +35,27 @@ Or from source:
 pip install -e /path/to/evidencespine
 ```
 
+## Harness install (hooks)
+
+```bash
+evidencespine harness install --harness claude-code --target-dir . --scope project
+# writes .claude-plugin/plugin.json (pointer) + hooks/hooks.json
+#   (wrapped {"hooks": {...}}: SessionStart/SessionEnd/PreCompact, list-shape
+#   with matcher + timeout), .mcp.json (plugin-root MCP registration, also
+#   Claude Code's project MCP scope) and merges .claude/settings.json
+#   (non-destructive).
+# Global: --target-dir <plugin-home> --scope global (settings merge goes to
+# ~/.claude/settings.json).
+```
+
+Event contracts (`code.claude.com/docs/en/hooks`): `SessionStart` plaintext →
+context; `SessionEnd` is session terminate (distinct from per-turn `Stop`);
+`PreCompact` must return the
+`{"hookSpecificOutput": {"hookEventName": "PreCompact", "additionalContext": ...}}`
+envelope (handled by `harness claude-code precompact`). Validate with
+`claude plugin validate`. Hooks fire in CLI, IDE extension, and Desktop Code
+tab identically; legacy desktop-only MCP uses `claude_desktop_config.json`.
+
 ## Basic runtime
 
 ```python

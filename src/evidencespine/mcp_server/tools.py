@@ -197,7 +197,7 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
         """Re-verify grounded evidence against live files."""
         return get_runtime().check_evidence_stale(
             thread_id=thread_id,
-            source_root=source_root or ".",
+            source_root=source_root or grounding_root,
             dry_run=bool(dry_run),
         )
 

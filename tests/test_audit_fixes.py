@@ -224,4 +224,6 @@ def test_git_hook_script_quotes_arguments(tmp_path: Path) -> None:
     assert out["status"] == "ok"
     script = (repo / ".git" / "hooks" / "post-commit").read_text(encoding="utf-8")
     assert "'/path with spaces/evidencespine'" in script
-    assert "'.es with spaces'" in script
+    # base_dir is absolutized so hooks do not depend on hook-process CWD.
+    assert ".es with spaces" in script
+    assert "evidencespine-git-hook" in script

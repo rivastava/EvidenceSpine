@@ -67,12 +67,31 @@ def create_server(
                     holder["runtime"] = _build_runtime(base_dir, storage_format, runtime)
         return holder["runtime"]
 
-    server = MCPServer(
-        name="evidencespine",
-        title="EvidenceSpine Memory Server",
-        description=_SERVER_DESCRIPTION,
-        version=__version__,
-    )
+    try:
+        from evidencespine.usage import usage_guide_markdown as _guide
+
+        _instructions = _guide()
+        # Codex reads MCP instructions on init; keep the head self-contained.
+        if len(_instructions) > 4000:
+            _instructions = _instructions[:4000]
+    except Exception:
+        _instructions = _SERVER_DESCRIPTION
+    try:
+        server = MCPServer(
+            name="evidencespine",
+            title="EvidenceSpine Memory Server",
+            description=_SERVER_DESCRIPTION,
+            version=__version__,
+            instructions=_instructions,
+        )
+    except TypeError:
+        # Older MCP SDKs lack the instructions field; resources carry the guide.
+        server = MCPServer(
+            name="evidencespine",
+            title="EvidenceSpine Memory Server",
+            description=_SERVER_DESCRIPTION,
+            version=__version__,
+        )
     register_tools(server, get_runtime, source_root=_grounding_root())
     register_resources(server, get_runtime)
     register_prompts(server, get_runtime)

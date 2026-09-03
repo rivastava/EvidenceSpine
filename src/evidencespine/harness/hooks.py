@@ -66,7 +66,7 @@ def read_stdin_json() -> Dict[str, Any]:
 def _coerce_summary(explicit: Optional[str], input_json: Dict[str, Any]) -> str:
     if explicit and str(explicit).strip():
         return str(explicit).strip()
-    for key in ("conversation_summary", "summary"):
+    for key in ("conversation_summary", "summary", "custom_instructions", "prompt", "reason", "trigger"):
         value = input_json.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -77,13 +77,31 @@ def _coerce_summary(explicit: Optional[str], input_json: Dict[str, Any]) -> str:
     return ""
 
 
-def _extract_thread_id(thread_id: Optional[str], input_json: Dict[str, Any]) -> str:
+def extract_thread_id(thread_id: Optional[str], input_json: Dict[str, Any]) -> str:
     if thread_id and str(thread_id).strip():
         return str(thread_id).strip()
-    for key in ("thread_id", "project_id"):
+    for key in ("thread_id", "session_id", "conversation_id", "project_id", "sessionID"):
         value = input_json.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    # Codex/Claude nested shapes: {"session": {"id": ...}} / properties.info.id
+    for key in ("session", "properties"):
+        nested = input_json.get(key)
+        if isinstance(nested, dict):
+            for inner in ("id", "session_id"):
+                value = nested.get(inner)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            info = nested.get("info")
+            if isinstance(info, dict):
+                value = info.get("id")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    cwd = input_json.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        base = os.path.basename(cwd.strip().rstrip("/"))
+        if base:
+            return base
     return default_thread_id()
 
 
@@ -135,12 +153,12 @@ def handle_session_stop(
 ) -> Dict[str, Any]:
     """Auto-retain: record the session as an evidence-bound reflection event.
 
-    If ``auto_handoff`` is truthy (env ``EVIDENCESPINE_AUTO_HANDOFF=1``) a
+    If ``auto_handoff`` is truthy (or env ``EVIDENCESPINE_AUTO_HANDOFF=1``) a
     handoff packet is also emitted so a successor can resume with verified state.
     """
     try:
         payload = dict(input_json or {})
-        thread = _extract_thread_id(thread_id, payload)
+        thread = extract_thread_id(thread_id, payload)
         body = _coerce_summary(summary, payload)
         runtime = build_runtime(base_dir, storage_format)
         if not body and _env_bool("EVIDENCESPINE_SESSION_SUMMARY", True):
@@ -156,6 +174,7 @@ def handle_session_stop(
                 )
             except Exception:
                 body = ""
+        wants_handoff = bool(auto_handoff) or _env_bool("EVIDENCESPINE_AUTO_HANDOFF", False)
         result = runtime.ingest_event(
             {
                 "thread_id": thread,
@@ -166,15 +185,15 @@ def handle_session_stop(
                 "payload": {
                     "claim": f"session ended: {reason}",
                     "outcome": body[:4096],
-                    "next_actions": ["emit_handoff" if auto_handoff else ""],
+                    "next_actions": (["emit_handoff"] if wants_handoff else []),
                 },
                 "confidence": 0.7,
                 "salience": 0.5,
-                "metadata": {"harness_hook": reason, "auto_handoff": bool(auto_handoff)},
+                "metadata": {"harness_hook": reason, "auto_handoff": bool(wants_handoff)},
             }
         )
         handoff = None
-        if bool(auto_handoff):
+        if wants_handoff:
             try:
                 handoff = runtime.emit_handoff(role="auditor", thread_id=thread, scope="session handoff").to_dict()
             except Exception as exc:
@@ -201,7 +220,7 @@ def handle_precompact(
     """
     try:
         payload = dict(input_json or {})
-        thread = _extract_thread_id(thread_id, payload)
+        thread = extract_thread_id(thread_id, payload)
         body = _coerce_summary(summary, payload)
         runtime = build_runtime(base_dir, storage_format)
         if body:

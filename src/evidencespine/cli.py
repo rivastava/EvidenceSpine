@@ -392,6 +392,7 @@ def _cmd_harness(args: argparse.Namespace) -> int:
         return 0
 
     if action in {"session_start", "session_stop", "precompact", "compaction"}:
+        group = str(getattr(args, "harness_group", "") or "")
         if action == "session_start":
             print(
                 cmd_session_start(
@@ -416,16 +417,28 @@ def _cmd_harness(args: argparse.Namespace) -> int:
                 )
             )
         else:
-            print(
-                cmd_precompact(
-                    thread_id=getattr(args, "thread_id", None),
-                    summary=getattr(args, "summary", None),
-                    token_budget=int(getattr(args, "token_budget", 0)) or None,
-                    base_dir=base_dir,
-                    storage_format=storage_format,
-                    json_out=json_out,
-                )
+            note = cmd_precompact(
+                thread_id=getattr(args, "thread_id", None),
+                summary=getattr(args, "summary", None),
+                token_budget=int(getattr(args, "token_budget", 0)) or None,
+                base_dir=base_dir,
+                storage_format=storage_format,
+                json_out=json_out,
             )
+            # Codex/Claude PreCompact ignores plaintext; envelope is required.
+            # Opencode compaction consumes plaintext directly.
+            if not json_out and group in {"codex", "claude-code"}:
+                import json as _json
+
+                try:
+                    payload = _json.loads(note) if note.strip().startswith("{") else None
+                except Exception:
+                    payload = None
+                if not isinstance(payload, dict) or "hookSpecificOutput" not in payload:
+                    from evidencespine.harness.claude_code import precompact_envelope as _env
+
+                    note = _env(note)
+            print(note)
         return 0
 
     if action in {"git_hook", "test_record"}:
@@ -704,7 +717,11 @@ def build_parser() -> argparse.ArgumentParser:
     harness_sub = harness_cmd.add_subparsers(dest="harness_group", required=True)
 
     install_p = harness_sub.add_parser("install", help="Install the delivery layer into a harness")
-    install_p.add_argument("--harness", default="all", choices=["claude-code", "opencode", "cursor", "all"])
+    install_p.add_argument(
+        "--harness",
+        default="all",
+        choices=["claude-code", "opencode", "cursor", "vscode", "codex", "git", "agents-md", "all"],
+    )
     install_p.add_argument("--target-dir", default=".")
     install_p.add_argument("--harness-base-dir", default=".evidencespine")
     install_p.add_argument("--executable", default=None)
@@ -712,7 +729,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         default="project",
         choices=["project", "global"],
-        help="project writes .opencode/plugins/ under target-dir; global writes directly into target-dir",
+        help="project writes under target-dir (.opencode/plugins/, .claude-plugin/, .cursor/, .vscode/, .codex/); global writes directly into target-dir (e.g. ~/.config/opencode/plugins, ~/.claude, ~/.cursor, ~/.codex)",
     )
     install_p.set_defaults(harness_action="install")
     install_p.set_defaults(func=_cmd_harness)
@@ -726,6 +743,9 @@ def build_parser() -> argparse.ArgumentParser:
     for provider, actions in (
         ("claude-code", ("session-start", "session-stop", "precompact")),
         ("opencode", ("session-start", "session-stop", "compaction")),
+        ("codex", ("session-start", "session-stop", "precompact")),
+        ("cursor", ("session-start", "session-stop", "precompact")),
+        ("vscode", ("session-start", "session-stop", "precompact")),
         ("git", ("install-hook", "git-hook", "test-record")),
     ):
         provider_p = harness_sub.add_parser(provider, help=f"{provider} delivery hooks")

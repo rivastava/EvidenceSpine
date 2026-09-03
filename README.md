@@ -46,13 +46,14 @@ pip install -e .
 ## Supported harnesses
 
 Install-time harness delivery (`evidencespine harness install --harness <x>`):
-`opencode`, `claude-code`, `cursor`, `git` (commit/test hooks), or `all`.
+`opencode`, `claude-code`, `cursor`, `vscode`, `codex` (Codex first-class:
+`.codex/config.toml` MCP + `.codex/hooks.json`), `git` (commit/test hooks),
+`agents-md`, or `all`.
 
 The MCP server is harness-agnostic — any MCP-capable agent (opencode, Cursor,
-Claude Code, Codex CLI/IDE/desktop, generic MCP apps) gets the same tools and
-resources. Codex guidance arrives via the committed `AGENTS.md` (read by
-opencode, Codex, Cursor, and Claude Code alike) plus manual MCP registration —
-see `docs/CODEX.md` for the full Codex integration spec. A2A, the async
+Claude Code, Codex CLI/IDE/desktop, VSCode, generic MCP apps) gets the same
+tools and resources plus the `instructions` primer. See `docs/CODEX.md` for
+the Codex spec (`install_codex` now shipped). A2A, the async
 runtime, the CLI, and framework adapters (TranscriptAdapter, LangGraph,
 AutoGen) are additional harness-agnostic channels.
 

@@ -166,7 +166,8 @@ def record_test_result(
 
 _HOOK_SCRIPT = """#!/bin/sh
 # EvidenceSpine thin hook (installed by `evidencespine harness git install-hook`)
-__EXE__ harness git git-hook --sha "$(git rev-parse HEAD)" --base-dir __BASE__ >/dev/null 2>&1 || true
+# Sentinel: evidencespine-git-hook (do not remove this line)
+__EXE__ harness git git-hook --sha "$(git rev-parse HEAD)" --repo-dir "$(git rev-parse --show-toplevel)" --base-dir __BASE__ >/dev/null 2>&1 || true
 """
 
 
@@ -176,15 +177,76 @@ def _sh_quote(value: str) -> str:
     return shlex.quote(str(value))
 
 
+def _git_dir(repo_dir: str) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    if not os.path.isabs(raw):
+        raw = os.path.join(repo_dir, raw)
+    hooks_dir = os.path.join(raw, "hooks")
+    # git worktrees use a gitdir file; --git-dir resolves correctly.
+    return hooks_dir
+
+
 def install_git_hooks(repo_dir: str = ".", executable: str = "evidencespine", base_dir: str = ".evidencespine") -> Dict[str, Any]:
-    """Install post-commit and post-merge hooks in a git repository."""
-    hooks_dir = os.path.join(repo_dir, ".git", "hooks")
-    if not os.path.isdir(hooks_dir):
-        return {"status": "invalid", "reason": "not_a_git_repo"}
+    """Install post-commit and post-merge hooks in a git repository.
+
+    Non-destructive: existing hooks are preserved (backed up once to
+    ``<name>.pre-evidencespine``) and chained — the spine invocation is
+    appended when the sentinel is absent, making installs idempotent.
+    """
+    hooks_dir = _git_dir(repo_dir)
+    if not hooks_dir or not os.path.isdir(hooks_dir):
+        # Fallback for bare .git layout.
+        fallback = os.path.join(repo_dir, ".git", "hooks")
+        if not os.path.isdir(fallback):
+            return {"status": "invalid", "reason": "not_a_git_repo"}
+        hooks_dir = fallback
+    abs_base = base_dir if os.path.isabs(base_dir) else os.path.abspath(os.path.join(repo_dir, base_dir))
+    invocation = (
+        _HOOK_SCRIPT.replace("__EXE__", _sh_quote(executable)).replace("__BASE__", _sh_quote(abs_base)).strip() + "\n"
+    )
     installed = []
     for name in ("post-commit", "post-merge"):
-        script = _HOOK_SCRIPT.replace("__EXE__", _sh_quote(executable)).replace("__BASE__", _sh_quote(base_dir))
         path = os.path.join(hooks_dir, name)
+        existing = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    existing = handle.read()
+            except Exception:
+                existing = ""
+            if "evidencespine-git-hook" in existing or "evidencespine harness git git-hook" in existing:
+                installed.append(name)
+                continue
+            # Backup once, then chain.
+            backup = path + ".pre-evidencespine"
+            if not os.path.exists(backup):
+                try:
+                    with open(backup, "w", encoding="utf-8") as handle:
+                        handle.write(existing)
+                except Exception:
+                    pass
+            # Preserve shebang; append invocation.
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            if not existing.startswith("#!"):
+                existing = "#!/bin/sh\n" + existing
+            script = existing + invocation
+        else:
+            script = invocation
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(script)
         os.chmod(path, 0o755)

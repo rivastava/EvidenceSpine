@@ -17,14 +17,31 @@ def _runtime(base_dir: Path) -> AgentMemoryRuntime:
 
 
 def test_claude_code_manifest_hooks_shape() -> None:
+    from evidencespine.harness.claude_code import build_hooks_config, build_hooks_json, precompact_envelope
+
     manifest = build_manifest(executable="evidencespine", base_dir=".es")
     assert manifest["name"] == "evidencespine"
-    hooks = manifest["hooks"]
-    assert set(hooks) == {"SessionStart", "PreCompact", "Stop"}
-    assert hooks["SessionStart"]["hooks"][0]["type"] == "command"
-    assert "session-start" in hooks["SessionStart"]["hooks"][0]["command"]
-    assert "precompact" in hooks["PreCompact"]["hooks"][0]["command"]
-    assert "session-stop" in hooks["Stop"]["hooks"][0]["command"]
+    # Manifest holds pointers; components resolve from the plugin root
+    # (only plugin.json lives inside .claude-plugin/ per the spec).
+    assert manifest["hooks"] == "./hooks/hooks.json"
+    assert manifest["mcpServers"] == "./.mcp.json"
+    assert manifest["author"] == {"name": "EvidenceSpine Contributors"}
+    hooks_payload = build_hooks_json(executable="evidencespine", base_dir=".es")
+    hooks = hooks_payload["hooks"]
+    assert set(hooks) == {"SessionStart", "SessionEnd", "PreCompact"}
+    assert isinstance(hooks["SessionStart"], list)
+    assert hooks["SessionStart"][0]["hooks"][0]["type"] == "command"
+    assert "session-start" in hooks["SessionStart"][0]["hooks"][0]["command"]
+    assert "precompact" in hooks["PreCompact"][0]["hooks"][0]["command"]
+    assert "session-stop" in hooks["SessionEnd"][0]["hooks"][0]["command"]
+    # List-shape with matcher/timeout per code.claude.com/docs/en/hooks.
+    assert hooks["SessionStart"][0]["matcher"] == "startup|resume|clear|compact|fork"
+    assert hooks["SessionStart"][0]["hooks"][0]["timeout"] == 30
+    config = build_hooks_config(executable="evidencespine", base_dir=".es")
+    assert set(config["hooks"]) == {"SessionStart", "SessionEnd", "PreCompact"}
+    envelope = json.loads(precompact_envelope("note"))
+    assert envelope["hookSpecificOutput"]["hookEventName"] == "PreCompact"
+    assert envelope["hookSpecificOutput"]["additionalContext"] == "note"
 
 
 def test_opencode_plugin_ts_registers_delivery_hooks() -> None:
@@ -33,13 +50,18 @@ def test_opencode_plugin_ts_registers_delivery_hooks() -> None:
     assert '"evidencespine"' in source
     assert '"experimental.chat.system.transform"' in source
     assert '"experimental.session.compacting"' in source
-    assert 'event.type === "session.deleted"' in source
+    assert '"tool.execute.after"' in source
+    assert "session.created" in source
+    assert "session.deleted" in source
     assert "session-start" in source
     assert "session-stop" in source
     assert "compaction" in source
-    assert "command: executable" in source
+    assert "--thread-id" in source
     assert 'Plugin = async ({ $ })' in source
-    assert source.count("${executable}") == 3
+    # Fail-open resolves to empty (never poisons system context).
+    assert "console.warn" in source
+    assert 'return ""' in source
+    assert 'output.system.push("\\n\\n" + (await cached))' not in source
 
 
 def test_opencode_plugin_template_prewarms_session_start() -> None:
@@ -47,22 +69,22 @@ def test_opencode_plugin_template_prewarms_session_start() -> None:
 
     The TUI glitch was caused by the plugin spawning the python session-start
     inside the first-message pipeline (chat.system.transform). The template
-    must pre-warm at plugin load and the transform must await the warmup
-    promise — never call runSessionStart() or spawn `$` itself.
+    must pre-warm at plugin load and the transform must await a memoized
+    per-session promise — never spawn `$` itself.
     """
     source = build_plugin_ts(executable="/usr/bin/evidencespine", base_dir=".es")
-    assert "const warmup = runSessionStart()" in source, "session-start must be pre-warmed at plugin load"
-    assert 'cached = warmup' in source, "transform must await the pre-warmed promise"
-    assert source.count("runSessionStart()") == 2, "definition + exactly one call (the warmup)"
+    assert 'runSessionStart("default")' in source, "default session must be pre-warmed at plugin load"
+    assert "function briefFor(sessionID" in source, "transform must use per-session memoization"
+    assert source.count('runSessionStart("default")') == 1
 
     transform = source.split('"experimental.chat.system.transform"', 1)[1].split('"experimental.session.compacting"', 1)[0]
-    assert "runSessionStart()" not in transform, "transform must not spawn session-start"
+    assert "briefFor(sessionID)" in transform, "transform must await the memoized brief"
     assert "$\u0060" not in transform, "transform must not shell out at all"
 
 
 def test_opencode_plugin_template_has_no_render_side_effects() -> None:
     source = build_plugin_ts(executable="/usr/bin/evidencespine", base_dir=".es")
-    session_start = source.split("async function runSessionStart()", 1)[1].split("async function runSessionStop()", 1)[0]
+    session_start = source.split("async function runSessionStart(sessionID", 1)[1].split("async function runSessionStop(", 1)[0]
     assert "ingest" not in session_start and "emit" not in session_start, (
         "session-start command must be render-safe (reads briefs, no writes)"
     )
@@ -73,6 +95,44 @@ def test_cursor_mcp_json_shape() -> None:
     server = payload["mcpServers"]["evidencespine"]
     assert server["command"] == "evidencespine"
     assert server["args"] == ["mcp", "--base-dir", ".es"]
+
+
+def test_claude_mcp_json_merge_preserves_existing(tmp_path: Path) -> None:
+    from evidencespine.harness.claude_code import build_mcp_json, merge_mcp_json
+
+    payload = build_mcp_json(executable="/usr/bin/python -m evidencespine.cli", base_dir=".es")
+    server = payload["mcpServers"]["evidencespine"]
+    assert server["command"] == "/usr/bin/python"
+    assert server["args"] == ["-m", "evidencespine.cli", "mcp", "--base-dir", ".es"]
+    merged = merge_mcp_json({"mcpServers": {"other": {"command": "x"}}}, executable="evidencespine", base_dir=".es")
+    assert "other" in merged["mcpServers"] and "evidencespine" in merged["mcpServers"]
+    result = cmd_install(harness="claude-code", target_dir=str(tmp_path), base_dir=".es", executable="evidencespine")
+    assert (tmp_path / ".mcp.json").exists()
+    assert (tmp_path / "hooks" / "hooks.json").exists()
+    assert str(tmp_path / ".mcp.json") in result["wrote"]
+
+
+def test_cursor_hooks_json_has_version_and_thread_keys() -> None:
+    from evidencespine.harness.cursor import build_hooks_json
+    from evidencespine.harness.hooks import extract_thread_id
+
+    payload = build_hooks_json(executable="evidencespine", base_dir=".es")
+    assert payload["version"] == 1
+    assert set(payload["hooks"]) == {"sessionStart", "preCompact", "stop"}
+    # Cursor hook stdin carries conversation_id (cursor.com/docs/hooks).
+    assert extract_thread_id(None, {"conversation_id": "conv-1"}) == "conv-1"
+    assert extract_thread_id("", {"session_id": "sess-1"}) == "sess-1"
+
+
+def test_cursor_mcp_json_splits_multitoken_executable() -> None:
+    from evidencespine.harness.cursor import build_mcp_json, merge_mcp_json
+
+    payload = build_mcp_json(executable="/usr/bin/python -m evidencespine.cli", base_dir=".es")
+    server = payload["mcpServers"]["evidencespine"]
+    assert server["command"] == "/usr/bin/python"
+    assert server["args"] == ["-m", "evidencespine.cli", "mcp", "--base-dir", ".es"]
+    merged = merge_mcp_json({"mcpServers": {"other": {"command": "x", "args": []}}}, executable="evidencespine", base_dir=".es")
+    assert "other" in merged["mcpServers"] and "evidencespine" in merged["mcpServers"]
 
 
 def test_opencode_plugin_ts_splits_multitoken_executable_for_mcp() -> None:
@@ -162,11 +222,35 @@ def test_install_writes_harness_files(tmp_path: Path) -> None:
     result = cmd_install(harness="all", target_dir=str(tmp_path), base_dir=".es", executable="evidencespine")
     assert result["status"] == "ok"
     written = set(result["wrote"])
-    assert written == {
+    # Core artifacts must exist (superset: install is merge-preserving + multi-harness).
+    for expected in (
         str(tmp_path / ".claude-plugin" / "plugin.json"),
+        str(tmp_path / "hooks" / "hooks.json"),
+        str(tmp_path / ".mcp.json"),
         str(tmp_path / ".opencode" / "plugins" / "evidencespine.ts"),
         str(tmp_path / ".cursor" / "mcp.json"),
-    }
+        str(tmp_path / ".vscode" / "mcp.json"),
+        str(tmp_path / ".codex" / "config.toml"),
+        str(tmp_path / ".codex" / "hooks.json"),
+        str(tmp_path / "AGENTS.md"),
+    ):
+        assert expected in written, f"missing {expected} in {sorted(written)}"
+
+
+def test_install_codex_writes_config_and_hooks(tmp_path: Path) -> None:
+    from evidencespine.harness.codex import build_hooks_json, precompact_envelope
+
+    result = cmd_install(harness="codex", target_dir=str(tmp_path), base_dir=".es", executable="evidencespine")
+    assert result["status"] == "ok"
+    config = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert "[mcp_servers.evidencespine]" in config
+    assert "[features]" in config and "hooks = true" in config
+    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    assert set(hooks["hooks"]) == {"SessionStart", "SessionEnd", "PreCompact"}
+    assert hooks["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] == 30
+    envelope = json.loads(precompact_envelope("x"))
+    assert envelope["hookSpecificOutput"]["hookEventName"] == "PreCompact"
+    _ = build_hooks_json(executable="evidencespine", base_dir=".es")
 
 
 def test_install_opencode_global_scope_writes_directly(tmp_path: Path) -> None:

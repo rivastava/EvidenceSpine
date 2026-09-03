@@ -217,7 +217,9 @@ evidencespine mcp --transport streamable-http --port 8000
 ```
 
 Tools: `ingest_event`, `build_brief`, `query_view`, `emit_handoff`,
-`import_handoff`, `reconcile`, `snapshot`, `prune`.
+`import_handoff`, `ground`, `check_drift`, `verify_fact`, `reconcile`,
+`snapshot`, `prune` (11 tools; server also advertises the usage-guide
+`instructions` primer for Codex/GUI discovery).
 Resources: `evidencespine://brief/{thread_id}`, `evidencespine://view/{view}`,
 `evidencespine://state/{scope_id}`, `evidencespine://snapshot`.
 Prompts: `session_start`, `handoff_receive`, `handoff_send`.
@@ -238,11 +240,13 @@ returns a one-line notice instead of failing the session.
 
 | Harness | Install target | What is wired |
 | --- | --- | --- |
-| opencode | `.opencode/plugins/evidencespine.ts` (or global) | plugin + MCP server, session-start/stop/compaction |
-| claude-code | `.claude-plugin/plugin.json` | session-start/stop/precompact hooks |
-| cursor | `.cursor/mcp.json` | MCP server registration |
+| opencode | `.opencode/plugins/evidencespine.ts` (or global) | plugin + MCP server, session-start/stop/compaction, tool.execute.after auto-capture |
+| claude-code | `.claude-plugin/plugin.json` + `hooks/hooks.json` + `.mcp.json` + `.claude/settings.json` merge | session-start/end/precompact hooks (list-shape, envelope-aware) + MCP |
+| cursor | `.cursor/mcp.json` (merge) + `rules/evidencespine.mdc` + `permissions.json` + `hooks.json` | MCP registration, alwaysApply rules, allowlist, session hooks |
+| vscode | `.vscode/mcp.json` (`servers` key) | MCP registration (GUI-compatible) |
+| codex | `.codex/config.toml` + `.codex/hooks.json` | MCP + SessionStart/SessionEnd/PreCompact (Codex-first) |
+| agents-md | `AGENTS.md` (only when missing/appended) | GUI discovery for MCP-only clients |
 | git | `.git/hooks/` post-commit/post-merge | commit spans + test-record |
-| codex | — (manual, see `docs/CODEX.md`) | AGENTS.md guidance + manual MCP registration; full `install_codex` harness wiring is planned, not yet shipped |
 
 The MCP server itself is harness-agnostic: any MCP-capable client (opencode,
 Cursor, Claude Code, Codex CLI/IDE/desktop, generic MCP apps) gets the same

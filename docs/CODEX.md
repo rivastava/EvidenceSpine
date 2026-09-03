@@ -1,10 +1,11 @@
-# Codex support (status: guidance + manual MCP; harness install planned)
+# Codex support (MCP + hooks installer shipped)
 
 EvidenceSpine works with OpenAI Codex today through the standard channels;
-a full `install_codex` harness wiring (config + lifecycle hooks) is planned
-but not yet shipped. This page documents the verified integration surface so
-users can wire Codex manually now and contributors can implement the
-installer against an accurate spec.
+`evidencespine harness install --harness codex` writes the project (default)
+or global (`--scope global`) `.codex/config.toml` MCP table
+(`[mcp_servers.evidencespine]`, `[features] hooks=true`) and `.codex/hooks.json`
+(SessionStart/SessionEnd/PreCompact). Manual registration below still works
+and documents the exact shapes the installer produces.
 
 ## What works today
 
@@ -65,10 +66,13 @@ covers the same need.
 
 ## Planned work
 
-- `evidencespine harness install --harness codex`: write project `.codex/`
+- [x] `evidencespine harness install --harness codex`: writes project `.codex/`
   (default) or `~/.codex/` (`--scope global`) with `config.toml` MCP table,
   `hooks.json` (SessionStart/SessionEnd/PreCompact), and shaped hook scripts
-  (plain text vs JSON envelope).
-- `evidencespine harness codex session-start|session-stop|precompact` provider
-  actions reusing the shared handlers.
-- Tests: parseable config.toml, hooks.json shape, hook output envelopes.
+  (plain text vs JSON envelope) — shipped.
+- [x] `evidencespine harness codex session-start|session-stop|precompact` provider
+  actions reusing the shared handlers — shipped.
+- Tests: parseable config.toml, hooks.json shape, hook output envelopes — see
+  `tests/test_harness.py::test_install_codex_writes_config_and_hooks`.
+- Remaining: `[features] hooks=true` uses the stable key (`codex_hooks`
+  deprecated); trust review via `/hooks` still required for project hooks.

@@ -24,6 +24,12 @@ def cmd_session_start(
     json_out: bool = False,
 ) -> str:
     """Render the auto-recall brief for injection into session context."""
+    stdin_payload = read_stdin_json()
+    # thread_id may arrive via hook stdin (session_id/sessionID/cwd).
+    if (not thread_id or not str(thread_id).strip()) and stdin_payload:
+        from evidencespine.harness.hooks import extract_thread_id
+
+        thread_id = extract_thread_id(None, stdin_payload)
     text = handle_session_start(
         thread_id=thread_id,
         objective=objective,
