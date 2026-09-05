@@ -246,7 +246,7 @@ returns a one-line notice instead of failing the session.
 
 | Harness | Install target | What is wired |
 | --- | --- | --- |
-| opencode | `.opencode/plugins/evidencespine.ts` (or global) | plugin + MCP server, session-start/stop/compaction, tool.execute.after auto-capture |
+| opencode | `.opencode/plugins/evidencespine.ts` (or global) | v2 plugin (`export default {id, setup}`): MCP transform, `session.hook("context")` recall, `tool.hook("execute.after")` capture, event-subscribe retain |
 | claude-code | `.claude-plugin/plugin.json` + `hooks/hooks.json` + `.mcp.json` + `.claude/settings.json` merge | session-start/end/precompact hooks (list-shape, envelope-aware) + MCP |
 | cursor | `.cursor/mcp.json` (merge) + `rules/evidencespine.mdc` + `permissions.json` + `hooks.json` | MCP registration, alwaysApply rules, allowlist, session hooks |
 | vscode | `.vscode/mcp.json` (`servers` key) | MCP registration (GUI-compatible) |

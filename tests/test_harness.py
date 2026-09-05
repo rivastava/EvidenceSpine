@@ -46,45 +46,51 @@ def test_claude_code_manifest_hooks_shape() -> None:
 
 def test_opencode_plugin_ts_registers_delivery_hooks() -> None:
     source = build_plugin_ts(executable="/usr/bin/evidencespine", base_dir=".es")
-    assert "type: \"local\"" in source
-    assert '"evidencespine"' in source
-    assert '"experimental.chat.system.transform"' in source
-    assert '"experimental.session.compacting"' in source
-    assert '"tool.execute.after"' in source
+    # v2 loader contract: default export with id + setup (LoadError otherwise).
+    assert "export default plugin" in source
+    assert 'id: "evidencespine"' in source
+    assert "async setup(ctx" in source
+    assert 'ctx.mcp.transform' in source
+    assert 'ctx.session.hook("context",' in source
+    assert 'ctx.tool.hook("execute.after",' in source
+    assert "ctx.event.subscribe" in source
+    # No v1 surface remains (the v1 loader is gone from the runtime).
+    assert "experimental." not in source
+    assert '"tool.execute.after"' not in source
+    assert '"experimental.session.compacting"' not in source
+    assert "export const EvidenceSpine" not in source
+    assert "({ $ })" not in source
     assert "session.created" in source
     assert "session.deleted" in source
     assert "session-start" in source
     assert "session-stop" in source
-    assert "compaction" in source
     assert "--thread-id" in source
-    assert 'Plugin = async ({ $ })' in source
-    # Fail-open resolves to empty (never poisons system context).
+    # Fail-open resolves to empty (never poisons model context).
     assert "console.warn" in source
-    assert 'return ""' in source
-    assert 'output.system.push("\\n\\n" + (await cached))' not in source
+    assert 'resolve("")' in source
+    # SystemPart shape per @opencode-ai/plugin dev types (bare {text} is rejected).
+    assert '{ type: "text", text:' in source
 
 
 def test_opencode_plugin_template_prewarms_session_start() -> None:
-    """Cold-start regression guard: the render path must never spawn the CLI.
+    """Cold-start regression guard: the context hook must never spawn the CLI.
 
-    The TUI glitch was caused by the plugin spawning the python session-start
-    inside the first-message pipeline (chat.system.transform). The template
-    must pre-warm at plugin load and the transform must await a memoized
-    per-session promise — never spawn `$` itself.
+    The first model call must await a memoized per-session promise pre-warmed
+    at setup — never spawn a process inside the hook itself.
     """
     source = build_plugin_ts(executable="/usr/bin/evidencespine", base_dir=".es")
-    assert 'runSessionStart("default")' in source, "default session must be pre-warmed at plugin load"
-    assert "function briefFor(sessionID" in source, "transform must use per-session memoization"
+    assert 'runSessionStart("default")' in source, "default session must be pre-warmed at setup"
+    assert "function briefForSession(sessionID" in source, "context hook must use per-session memoization"
     assert source.count('runSessionStart("default")') == 1
 
-    transform = source.split('"experimental.chat.system.transform"', 1)[1].split('"experimental.session.compacting"', 1)[0]
-    assert "briefFor(sessionID)" in transform, "transform must await the memoized brief"
-    assert "$\u0060" not in transform, "transform must not shell out at all"
+    context_hook = source.split('ctx.session.hook("context"', 1)[1].split('ctx.tool.hook(', 1)[0]
+    assert "briefForSession(" in context_hook, "context hook must await the memoized brief"
+    assert "execFile" not in context_hook, "context hook must not spawn processes itself"
 
 
 def test_opencode_plugin_template_has_no_render_side_effects() -> None:
     source = build_plugin_ts(executable="/usr/bin/evidencespine", base_dir=".es")
-    session_start = source.split("async function runSessionStart(sessionID", 1)[1].split("async function runSessionStop(", 1)[0]
+    session_start = source.split("function runSessionStart(sessionID", 1)[1].split("function runSessionStop(", 1)[0]
     assert "ingest" not in session_start and "emit" not in session_start, (
         "session-start command must be render-safe (reads briefs, no writes)"
     )
@@ -142,8 +148,9 @@ def test_opencode_plugin_ts_splits_multitoken_executable_for_mcp() -> None:
         base_dir=".es",
         mcp_command=mcp,
     )
-    assert 'command: ["/usr/bin/python", "-m", "evidencespine.cli", "mcp", "--base-dir", ".es"]' in source
-    assert '${executable} harness opencode session-start' in source
+    assert '["/usr/bin/python", "-m", "evidencespine.cli", "mcp", "--base-dir", ".es"]' in source
+    assert '["/usr/bin/python", "-m", "evidencespine.cli"]' in source
+    assert '"harness", "opencode", "session-start"' in source
 
 
 def test_session_start_returns_bounded_brief_markdown(tmp_path: Path) -> None:
