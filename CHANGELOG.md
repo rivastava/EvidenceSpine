@@ -36,6 +36,15 @@ All notable changes to this project will be documented in this file.
 - Cursor hook stdin resolves `conversation_id` for thread identity.
 
 ### Fixed
+- Opencode plugin rewritten for the v2 API (`export default { id, setup }`):
+  the v1 named-export shape no longer loads (`PluginModule.LoadError`, missing
+  `default`). Recall via `ctx.session.hook("context")` (primary + compaction),
+  capture via `ctx.tool.hook("execute.after")` (completed edit/write, real
+  `input` payload), MCP via `ctx.mcp.transform` (set-if-absent), retain via
+  `ctx.event.subscribe()`; shell-outs use `node:child_process` argv arrays with
+  a 60s timeout. Verified by strict `tsc` against the `@opencode-ai/plugin`
+  dev types (caught a `SystemPart` shape bug) and a 14-assertion node load test
+  with real process spawns.
 - Excerpts are byte-exact through normalization: spans starting on indented or
   blank lines (or ending on blank lines) now verify instead of being silently
   downgraded; whitespace-only spans are rejected as ungroundable at ground time.
