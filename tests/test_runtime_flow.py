@@ -586,6 +586,11 @@ def test_brief_excludes_superseded_facts_and_dedupes_sections(tmp_path: Path) ->
 
 def test_query_view_resolves_latest_scope_state_and_filters(tmp_path: Path) -> None:
     rt = _runtime(tmp_path)
+    from datetime import datetime, timedelta, timezone
+
+    def _ts(seconds_ago: int) -> str:
+        return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     rt.ingest_event(
         {
             "thread_id": "demo",
@@ -593,6 +598,7 @@ def test_query_view_resolves_latest_scope_state_and_filters(tmp_path: Path) -> N
             "role": "implementer",
             "source_agent_id": "impl",
             "source_turn_id": "t1",
+            "ts_utc": _ts(60),
             "payload": {"claim": "Work started", "fact_state": "asserted"},
             "state_context": {
                 "scope_id": "auth-timeout-fix",
@@ -609,6 +615,7 @@ def test_query_view_resolves_latest_scope_state_and_filters(tmp_path: Path) -> N
             "role": "auditor",
             "source_agent_id": "auditor",
             "source_turn_id": "t2",
+            "ts_utc": _ts(30),
             "payload": {"claim": "Release gate ready", "fact_state": "verified"},
             "state_context": {
                 "scope_id": "release-gate",
@@ -625,6 +632,7 @@ def test_query_view_resolves_latest_scope_state_and_filters(tmp_path: Path) -> N
             "role": "implementer",
             "source_agent_id": "impl",
             "source_turn_id": "t3",
+            "ts_utc": _ts(10),
             "payload": {"claim": "Work complete", "fact_state": "verified"},
             "state_context": {
                 "scope_id": "auth-timeout-fix",

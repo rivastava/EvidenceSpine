@@ -8,8 +8,10 @@ recall, handoff receive, handoff send.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Callable
 
+from evidencespine.mcp_server.tools import _confine_handoff_path
 from evidencespine.render import render_brief_markdown, render_snapshot_markdown
 
 
@@ -30,8 +32,14 @@ def _brief_markdown(get_runtime: Callable[[], Any], thread_id: str, query: str) 
     return render_brief_markdown(get_runtime().build_brief(thread_id=thread_id, query=query).to_dict())
 
 
-def register_prompts(server: Any, get_runtime: Callable[[], Any]) -> None:
-    """Register EvidenceSpine prompts on an MCPServer instance."""
+def register_prompts(server: Any, get_runtime: Callable[[], Any], *, source_root: str = "") -> None:
+    """Register EvidenceSpine prompts on an MCPServer instance.
+
+    source_root is the server grounding root: handoff packet paths passed to
+    the handoff_receive prompt are confined to it (absolute paths and escapes
+    are rejected) exactly like the import_handoff tool.
+    """
+    grounding_root = os.path.realpath(source_root or os.getcwd())
 
     @server.prompt(
         name="session_start",
@@ -72,7 +80,17 @@ def register_prompts(server: Any, get_runtime: Callable[[], Any]) -> None:
         packet_path = _clean_arg(packet_path, "")
         runtime = get_runtime()
         if packet_path:
-            result = runtime.import_handoff(packet_path, source_agent_id=source_agent_id)
+            confined = _confine_handoff_path(packet_path, grounding_root)
+            if confined is None:
+                result = {"status": "invalid", "reason": "path_outside_source_root"}
+            else:
+                # Bind imported rows to the requested importer thread so the
+                # rendered brief reflects the import instead of staying empty.
+                result = runtime.import_handoff(
+                    confined,
+                    source_agent_id=source_agent_id,
+                    thread_id=thread_id,
+                )
             imported = json.dumps(result, indent=2, ensure_ascii=True)
         else:
             imported = (

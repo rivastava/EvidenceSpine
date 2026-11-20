@@ -13,6 +13,8 @@ flows in with zero agent effort.
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,8 +37,6 @@ def _run_git(repo_dir: str, args: List[str]) -> subprocess.CompletedProcess[str]
 
 def _added_ranges(diff_text: str) -> List[Tuple[int, int]]:
     """Extract new-file line ranges from unified diff hunks."""
-    import re
-
     ranges: List[Tuple[int, int]] = []
     for line in diff_text.splitlines():
         match = re.match(_HUNK_RE, line)
@@ -44,7 +44,10 @@ def _added_ranges(diff_text: str) -> List[Tuple[int, int]]:
             continue
         start = int(match.group(2))
         length = int(match.group(3) or "1")
-        ranges.append((start, start + max(0, length - 1)))
+        if length <= 0:
+            # Pure-deletion hunk ("@@ -5,3 +5,0 @@"): no added lines to ground.
+            continue
+        ranges.append((start, start + length - 1))
     return ranges
 
 
@@ -59,7 +62,10 @@ def record_commit(
 ) -> Dict[str, Any]:
     """Ingest one action event for a commit with span-grounded evidence items."""
     short = sha[:12]
-    subject = _run_git(repo_dir, ["log", "-1", "--format=%s", sha]).stdout.strip()
+    log_proc = _run_git(repo_dir, ["log", "-1", "--format=%s", sha])
+    if log_proc.returncode != 0:
+        return {"status": "invalid", "reason": "unknown_commit", "commit": sha}
+    subject = log_proc.stdout.strip()
     name_only = _run_git(repo_dir, ["show", "--name-only", "--format=", sha]).stdout
     files = [f.strip() for f in name_only.splitlines() if f.strip()][: max(1, int(limit_files))]
 
@@ -164,10 +170,21 @@ def record_test_result(
         runtime.store.close()
 
 
+#: Sentinel comment identifying an EvidenceSpine-managed hook.
+_HOOK_SENTINEL = "evidencespine-git-hook"
+
+#: Shell command a managed hook runs. __EXE__ is an argv-prefix of individually
+#: quoted tokens (so "python3 -m evidencespine.cli" works) and __BASE__ is a
+#: single quoted absolute path.
+_HOOK_INVOCATION = (
+    '__EXE__ harness git git-hook --sha "$(git rev-parse HEAD)"'
+    ' --repo-dir "$(git rev-parse --show-toplevel)" --base-dir __BASE__ >/dev/null 2>&1 || true'
+)
+
 _HOOK_SCRIPT = """#!/bin/sh
 # EvidenceSpine thin hook (installed by `evidencespine harness git install-hook`)
 # Sentinel: evidencespine-git-hook (do not remove this line)
-__EXE__ harness git git-hook --sha "$(git rev-parse HEAD)" --repo-dir "$(git rev-parse --show-toplevel)" --base-dir __BASE__ >/dev/null 2>&1 || true
+""" + _HOOK_INVOCATION + """
 """
 
 
@@ -175,6 +192,82 @@ def _sh_quote(value: str) -> str:
     import shlex
 
     return shlex.quote(str(value))
+
+
+def _executable_argv(executable: str) -> List[str]:
+    """Split an executable into argv tokens without breaking spaced paths.
+
+    An existing path (or a string whose first word does not resolve to a
+    command) is treated as one executable token; only genuine multi-token
+    launchers like "python3 -m evidencespine.cli" are split.
+    """
+    text = str(executable or "").strip()
+    if not text:
+        return ["evidencespine"]
+    if os.path.exists(text):
+        return [text]
+    import shlex
+
+    try:
+        argv = shlex.split(text)
+    except Exception:
+        return [text]
+    if len(argv) <= 1:
+        return argv or ["evidencespine"]
+    first = argv[0]
+    if shutil.which(first) is not None or os.path.exists(first):
+        return argv
+    return [text]
+
+
+def _quote_argv_prefix(executable: str) -> str:
+    """Quote each argv token of the executable separately.
+
+    Quoting the whole multi-token string (shlex.quote("python3 -m mod")) would
+    pass it to the shell as one filename and the hook could never run; joining
+    individually quoted tokens keeps both the multi-token launcher and a
+    single spaced path executable working.
+    """
+    import shlex
+
+    return " ".join(shlex.quote(token) for token in _executable_argv(executable))
+
+
+def _render_hook_invocation(executable: str, base_dir: str) -> str:
+    invocation = _HOOK_INVOCATION.replace("__EXE__", _quote_argv_prefix(executable))
+    return invocation.replace("__BASE__", _sh_quote(str(base_dir)))
+
+
+def _render_hook_script(executable: str, base_dir: str) -> str:
+    return _HOOK_SCRIPT.replace("__EXE__", _quote_argv_prefix(executable)).replace(
+        "__BASE__", _sh_quote(str(base_dir))
+    )
+
+
+def _insert_before_trailing_exit(existing: str, invocation: str) -> str:
+    """Insert a chained invocation before a trailing shell 'exit' statement.
+
+    Appending after an unconditional "exit 0" would make the spine hook dead
+    code in a chained user hook; insert before the last top-level exit instead.
+    """
+    text = str(existing or "")
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if not text.startswith("#!"):
+        text = "#!/bin/sh\n" + text
+    lines = text.splitlines()
+    insert_at = None
+    for index in range(len(lines) - 1, -1, -1):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.match(r"^exit(?:\s|;|$)", stripped):
+            insert_at = index
+        break
+    if insert_at is None:
+        return text + invocation + "\n"
+    merged = lines[:insert_at] + [invocation] + lines[insert_at:]
+    return "\n".join(merged) + "\n"
 
 
 def _git_dir(repo_dir: str) -> Optional[str]:
@@ -215,9 +308,8 @@ def install_git_hooks(repo_dir: str = ".", executable: str = "evidencespine", ba
             return {"status": "invalid", "reason": "not_a_git_repo"}
         hooks_dir = fallback
     abs_base = base_dir if os.path.isabs(base_dir) else os.path.abspath(os.path.join(repo_dir, base_dir))
-    invocation = (
-        _HOOK_SCRIPT.replace("__EXE__", _sh_quote(executable)).replace("__BASE__", _sh_quote(abs_base)).strip() + "\n"
-    )
+    invocation = _render_hook_invocation(executable, abs_base)
+    fresh_script = _render_hook_script(executable, abs_base)
     installed = []
     for name in ("post-commit", "post-merge"):
         path = os.path.join(hooks_dir, name)
@@ -239,14 +331,11 @@ def install_git_hooks(repo_dir: str = ".", executable: str = "evidencespine", ba
                         handle.write(existing)
                 except Exception:
                     pass
-            # Preserve shebang; append invocation.
-            if existing and not existing.endswith("\n"):
-                existing += "\n"
-            if not existing.startswith("#!"):
-                existing = "#!/bin/sh\n" + existing
-            script = existing + invocation
+            # Preserve the user hook; insert the spine invocation before a
+            # trailing 'exit' so chained hooks actually run it.
+            script = _insert_before_trailing_exit(existing, invocation)
         else:
-            script = invocation
+            script = fresh_script
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(script)
         os.chmod(path, 0o755)

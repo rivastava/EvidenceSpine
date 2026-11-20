@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
-from evidencespine.harness.git import install_git_hooks, record_commit, record_test_result
+import pytest
+
+from evidencespine.harness.git import _added_ranges, install_git_hooks, record_commit, record_test_result
 from evidencespine.runtime import AgentMemoryRuntime
 from evidencespine.settings import EvidenceSpineSettings
 
@@ -35,7 +40,7 @@ def test_record_commit_ingests_event_with_grounded_spans(tmp_path: Path) -> None
     repo = _make_repo(tmp_path)
     (repo / "mod.py").write_text("def a():\n    return 1\n\ndef b():\n    return 2\n", encoding="utf-8")
     _git(repo, "add", ".")
-    sha = _git(repo, "commit", "-q", "-m", "add function b")
+    _git(repo, "commit", "-q", "-m", "add function b")
     sha = _git(repo, "rev-parse", "HEAD")
 
     out = record_commit(sha, repo_dir=str(repo), base_dir=str(tmp_path / ".es"))
@@ -50,6 +55,19 @@ def test_record_commit_ingests_event_with_grounded_spans(tmp_path: Path) -> None
     assert items and all(i.get("excerpt") and i.get("checksum") for i in items), "spans must be grounded"
     assert any("add function b" in str(e.get("payload", {}).get("claim", "")) for e in events)
     rt.store.close()
+
+
+def test_record_commit_unknown_sha_is_invalid_not_ok(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    out = record_commit("deadbeef" * 5, repo_dir=str(repo), base_dir=str(tmp_path / ".es"))
+    assert out["status"] == "invalid"
+    assert out["reason"] == "unknown_commit"
+
+
+def test_added_ranges_skips_pure_deletion_hunks() -> None:
+    assert _added_ranges("@@ -5,3 +5,0 @@") == []
+    assert _added_ranges("@@ -1,2 +1,3 @@") == [(1, 3)]
+    assert _added_ranges("@@ -1 +7 @@") == [(7, 7)]
 
 
 def test_record_test_result_passed_is_verified_with_provenance(tmp_path: Path) -> None:
@@ -85,8 +103,57 @@ def test_install_git_hooks_writes_scripts(tmp_path: Path) -> None:
         assert script.stat().st_mode & 0o111, "hook must be executable"
 
 
-def test_record_commit_missing_sha_fails_open(tmp_path: Path) -> None:
+def test_install_git_hooks_quotes_multitoken_executable(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
-    out = record_commit("deadbeef" * 5, repo_dir=str(repo), base_dir=str(tmp_path / ".es"))
-    assert out["status"] == "ok"  # fail-open: empty subject, no spans, event still recorded
-    assert out["items"] == 0
+    out = install_git_hooks(
+        repo_dir=str(repo),
+        executable=f"{sys.executable} -m evidencespine.cli",
+        base_dir=".es",
+    )
+    assert out["status"] == "ok"
+    script = (repo / ".git" / "hooks" / "post-commit").read_text(encoding="utf-8")
+    assert shlex.quote(sys.executable) in script
+    # Individually quoted argv tokens, not one quoted blob.
+    assert f"{shlex.quote(sys.executable)} -m evidencespine.cli harness git git-hook" in script
+
+
+def test_install_git_hooks_inserts_before_trailing_exit(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    path = repo / ".git" / "hooks" / "post-commit"
+    path.write_text("#!/bin/sh\necho user-hook\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    out = install_git_hooks(repo_dir=str(repo), executable="evidencespine", base_dir=".es")
+    assert out["status"] == "ok"
+    script = path.read_text(encoding="utf-8")
+    assert "echo user-hook" in script, "user hook preserved"
+    lines = script.splitlines()
+    invocation_index = next(i for i, line in enumerate(lines) if "harness git git-hook" in line)
+    exit_index = next(i for i, line in enumerate(lines) if line.strip() == "exit 0")
+    assert invocation_index < exit_index, "spine invocation must run before an unconditional exit"
+    assert (repo / ".git" / "hooks" / "post-commit.pre-evidencespine").exists(), "backup written"
+
+
+def test_install_git_hooks_is_idempotent(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    install_git_hooks(repo_dir=str(repo), executable="evidencespine", base_dir=".es")
+    first = (repo / ".git" / "hooks" / "post-commit").read_text(encoding="utf-8")
+    install_git_hooks(repo_dir=str(repo), executable="evidencespine", base_dir=".es")
+    second = (repo / ".git" / "hooks" / "post-commit").read_text(encoding="utf-8")
+    assert first == second
+    assert second.count("harness git git-hook") == 1
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_installed_git_hook_actually_runs_on_commit(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    marker = tmp_path / "marker.txt"
+    fake = tmp_path / "fake-exe"
+    fake.write_text(f"#!/bin/sh\necho ran >> {marker}\n", encoding="utf-8")
+    fake.chmod(0o755)
+    out = install_git_hooks(repo_dir=str(repo), executable=str(fake), base_dir=".evidencespine")
+    assert out["status"] == "ok"
+    (repo / "change.txt").write_text("change\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "trigger hook")
+    assert marker.exists(), "post-commit hook must execute a real git commit"
+    assert "ran" in marker.read_text(encoding="utf-8")

@@ -11,13 +11,52 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Callable, Dict
+import os
+from typing import Any, Callable, Dict, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events.event_queue import EventQueue
 from a2a.types import a2a_pb2
 
 from evidencespine.protocol import safe_text
+
+#: Documented control views (hyphen aliases accepted), mirrored from the MCP
+#: tool layer so an unknown view is rejected instead of silently rendering
+#: unfiltered active_scopes rows.
+_CONTROL_VIEWS: tuple[str, ...] = (
+    "active_scopes",
+    "my_work",
+    "open_gates",
+    "stale_claims",
+    "contradictions",
+)
+
+
+def _normalize_control_view(view: str) -> str:
+    text = str(view or "").strip().lower().replace("-", "_")
+    return text if text in _CONTROL_VIEWS else ""
+
+
+def _resolve_grounding_root(source_root: str = "") -> str:
+    """Resolve the executor grounding root: explicit arg, env, then cwd."""
+    configured = str(source_root or "").strip() or str(os.environ.get("EVIDENCESPINE_SOURCE_ROOT", "") or "").strip()
+    return os.path.realpath(configured or os.getcwd())
+
+
+def _confine_handoff_path(raw_path: str, grounding_root: str) -> Optional[str]:
+    """Resolve a caller-supplied packet path inside the grounding root.
+
+    Mirrors the MCP import_handoff confinement: absolute paths and paths
+    escaping the root (including via symlinks) return None.
+    """
+    text = str(raw_path or "").strip()
+    if not text or os.path.isabs(text):
+        return None
+    root_real = os.path.realpath(grounding_root)
+    candidate = os.path.realpath(os.path.join(root_real, text))
+    if candidate == root_real or not candidate.startswith(root_real + os.sep):
+        return None
+    return candidate
 
 
 class EvidenceSpineExecutor(AgentExecutor):
@@ -35,10 +74,15 @@ class EvidenceSpineExecutor(AgentExecutor):
         "prune",
     }
 
-    def __init__(self, get_runtime: Callable[[], Any]) -> None:
-        """``get_runtime`` builds an ``AgentMemoryRuntime`` (lazily, once)."""
+    def __init__(self, get_runtime: Callable[[], Any], source_root: str = "") -> None:
+        """``get_runtime`` builds an ``AgentMemoryRuntime`` (lazily, once).
+
+        ``source_root`` is the grounding root for handoff packet path imports
+        (defaults to EVIDENCESPINE_SOURCE_ROOT or the process cwd).
+        """
         self._get_runtime = get_runtime
         self._runtime = None
+        self._grounding_root = _resolve_grounding_root(source_root)
 
     @property
     def runtime(self) -> Any:
@@ -173,8 +217,16 @@ class EvidenceSpineExecutor(AgentExecutor):
             view = safe_text(params.get("view"), "", 64)
             if not view:
                 return {"status": "error", "reason": "view is required"}
+            view_name = _normalize_control_view(view)
+            if not view_name:
+                return {
+                    "status": "invalid",
+                    "reason": "unknown_view",
+                    "view": view,
+                    "valid_views": list(_CONTROL_VIEWS),
+                }
             return rt.query_view(
-                view,
+                view_name,
                 thread_id=safe_text(params.get("thread_id"), thread, 128),
                 owner_agent_id=safe_text(params.get("owner_agent_id"), "", 128),
                 include_closed=bool(params.get("include_closed", False)),
@@ -188,8 +240,17 @@ class EvidenceSpineExecutor(AgentExecutor):
             ).to_dict()
         if action == "import_handoff":
             packet = params.get("packet")
+            payload: Any = packet
+            if payload is None:
+                raw_path = str(params.get("path", "") or "").strip()
+                if not raw_path:
+                    return {"status": "invalid", "reason": "missing_path"}
+                confined = _confine_handoff_path(raw_path, self._grounding_root)
+                if confined is None:
+                    return {"status": "invalid", "reason": "path_outside_source_root"}
+                payload = confined
             return rt.import_handoff(
-                packet if packet is not None else str(params.get("path", "")),
+                payload,
                 source_agent_id=safe_text(params.get("source_agent_id"), "external_agent", 128),
                 thread_id=safe_text(params.get("thread_id"), "", 128),
             )
@@ -205,6 +266,6 @@ class EvidenceSpineExecutor(AgentExecutor):
                 thread_id=safe_text(params.get("thread_id"), "", 128),
                 ttl_hours=float(params.get("ttl_hours", 720.0)),
                 ttl_hours_facts=params.get("ttl_hours_facts"),
-                dry_run=bool(params.get("dry_run", False)),
+                dry_run=bool(params.get("dry_run", True)),
             )
         return {"status": "error", "reason": f"unknown action: {action}"}

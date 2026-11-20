@@ -12,6 +12,7 @@ def build_agent_card(
     name: str = "evidencespine-agent",
     description: str | None = None,
     version: str | None = None,
+    url: str = "",
 ) -> Any:
     """Build the A2A ``AgentCard`` advertising EvidenceSpine memory skills.
 
@@ -37,6 +38,13 @@ def build_agent_card(
             push_notifications=False,
         ),
     )
+    # A2A 1.x clients resolve transports from supported_interfaces; a card
+    # without one makes a2a-sdk clients fail with "no compatible transports".
+    if str(url or "").strip():
+        card.supported_interfaces.add(
+            url=str(url).strip(),
+            protocol_binding="JSONRPC",
+        )
     card.skills.extend(
         [
             a2a_pb2.AgentSkill(

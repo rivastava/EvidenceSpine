@@ -119,6 +119,9 @@ def test_transcript_adapter_returns_structured_ingest_result(tmp_path: Path) -> 
         "ingested": 2,
         "failed": 0,
         "skipped": 1,
+        "deduped": 0,
+        "disabled": 0,
+        "new_events": 2,
     }
 
 

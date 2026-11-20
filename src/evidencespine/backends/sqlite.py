@@ -205,17 +205,29 @@ class SqliteStoreBackend(StoreBackend):
             ).fetchall()
         return [json.loads(r[0]) for r in rows]
 
-    def iter_events(self) -> Iterator[Dict[str, Any]]:
+    def iter_events(self, thread_id: str = "") -> Iterator[Dict[str, Any]]:
+        target = safe_text(thread_id, "", 128)
         with self._lock:
             conn = self._connect()
-            rows = conn.execute("SELECT row_json FROM events ORDER BY id ASC").fetchall()
+            if target:
+                rows = conn.execute(
+                    "SELECT row_json FROM events WHERE thread_id = ? ORDER BY id ASC", (target,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT row_json FROM events ORDER BY id ASC").fetchall()
         for r in rows:
             yield json.loads(r[0])
 
-    def iter_facts(self) -> Iterator[Dict[str, Any]]:
+    def iter_facts(self, thread_id: str = "") -> Iterator[Dict[str, Any]]:
+        target = safe_text(thread_id, "", 128)
         with self._lock:
             conn = self._connect()
-            rows = conn.execute("SELECT row_json FROM facts ORDER BY id ASC").fetchall()
+            if target:
+                rows = conn.execute(
+                    "SELECT row_json FROM facts WHERE thread_id = ? ORDER BY id ASC", (target,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT row_json FROM facts ORDER BY id ASC").fetchall()
         for r in rows:
             yield json.loads(r[0])
 

@@ -5,7 +5,10 @@ Each loop watches the room thread for new messages, renders the
 conversation (rolling window + auto-summary), calls an LLM backend (default:
 headless ``opencode run --pure``), and publishes the reply back to the
 store. Messages land within a poll interval plus LLM latency; the run stops
-on consensus, a quiet period, a message budget, or a duration cap.
+on consensus, a quiet period, a message budget, a duration cap, or backend
+failure. A dead LLM can never hang a run: cumulative backend errors stop the
+room, and when ``minutes == 0`` a hard wall-clock backstop (derived from
+``quiet_secs``, never above 180s) terminates it.
 
 Chat messages are stored as events whose payload carries only ``chat``
 text (no ``claim``/``decision``/``outcome`` keys), so they never pollute
@@ -190,6 +193,8 @@ class ChatCoordinator:
         facilitator_budget: int = 3,
         summarizer_backend: Optional[Callable[[str], str]] = None,
         facilitator_backend: Optional[Callable[[str], str]] = None,
+        max_wall_secs: float = 0.0,
+        max_consecutive_failures: int = 0,
     ) -> None:
         self.runtime = runtime
         self.thread_id = thread_id
@@ -213,6 +218,18 @@ class ChatCoordinator:
         self._last_publish_ts = 0.0
         self._summarized_through = 0
         self._facilitator_pumps = 0
+        self._facilitator_attempts = 0
+        # Additive hardening state: a broken backend must never hang the run.
+        self.max_wall_secs = float(max_wall_secs) if float(max_wall_secs or 0.0) > 0.0 else 0.0
+        self.max_consecutive_failures = (
+            max(1, int(max_consecutive_failures)) if int(max_consecutive_failures or 0) > 0 else 0
+        )
+        self._state_lock = threading.Lock()
+        self._backend_failures_total = 0
+        self._backend_failure_streak = 0
+        self._last_agent_reply_ts = 0.0
+        self._started_ts = 0.0
+        self._budget_reached = False
         self.stopped_by = "unknown"
 
     def _max_existing_seq(self) -> int:
@@ -250,6 +267,10 @@ class ChatCoordinator:
 
     def publish(self, text: str, agent: str = "host", extra_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         with self._publish_lock:
+            if self._budget_reached:
+                return {"status": "skipped", "reason": "max_messages", "chat_seq": self._seq}
+            if self._stop.is_set():
+                return {"status": "stopped", "reason": self.stopped_by, "chat_seq": self._seq}
             self._seq += 1
             seq = self._seq
             result = self.runtime.ingest_event(
@@ -272,10 +293,34 @@ class ChatCoordinator:
             )
             self.messages.append({"seq": seq, "agent": agent, "text": text, "summary": bool((extra_meta or {}).get("chat_summary"))})
             self._last_publish_ts = time.time()
+            is_summary = bool((extra_meta or {}).get("chat_summary"))
+            if agent != "host" and not is_summary:
+                self._last_agent_reply_ts = self._last_publish_ts
+            if len(self.messages) >= self.max_messages:
+                self._budget_reached = True
             return result
 
     def add_agent(self, role: str, persona: str, backend: Callable[[str], str]) -> None:
         self.agents.append(ChatAgent(role=role, persona=persona, backend=backend))
+
+    def _record_backend_failure(self) -> None:
+        with self._state_lock:
+            self._backend_failures_total += 1
+            self._backend_failure_streak += 1
+
+    def _record_backend_success(self) -> None:
+        with self._state_lock:
+            self._backend_failure_streak = 0
+
+    def _failure_limit(self) -> int:
+        """Consecutive backend errors tolerated before declaring the LLM dead."""
+        if self.max_consecutive_failures > 0:
+            return self.max_consecutive_failures
+        return max(3, len(self.agents) * 2)
+
+    def _derived_wall_secs(self) -> float:
+        """Hard wall-clock backstop used when no explicit minute cap is set."""
+        return min(180.0, max(30.0, self.quiet_secs * 10.0))
 
     def _latest_summary(self, messages: List[Dict[str, Any]]) -> str:
         for msg in reversed(messages):
@@ -342,12 +387,19 @@ class ChatCoordinator:
                 reply = reply.strip() or "."
                 self.publish(reply, agent=agent.role)
                 agent.last_seq = latest["seq"]
+                self._record_backend_success()
                 print(f"[{agent.role}] {reply}", flush=True)
             except Exception as exc:
+                self._record_backend_failure()
                 print(f"[{agent.role}] loop error: {exc}", flush=True)
                 time.sleep(self.interval)
 
     def run(self) -> Dict[str, Any]:
+        started = time.time()
+        self._started_ts = started
+        self._stop.clear()
+        for agent in self.agents:
+            agent.stop.clear()
         self.publish(f"Kickoff: {self.topic}", agent="host")
         threads = []
         for agent in self.agents:
@@ -355,39 +407,67 @@ class ChatCoordinator:
             threads.append(thread)
             thread.start()
 
-        deadline = time.time() + (self.minutes * 60.0) if self.minutes > 0 else None
-        while not self._stop.is_set():
-            messages = self._read_messages()
-            landed = len(messages)
-            if landed >= self.max_messages:
-                self.stopped_by = "max_messages"
-                break
-            if self._all_agreed():
-                self.stopped_by = "consensus"
-                break
-            if deadline is not None and time.time() >= deadline:
-                self.stopped_by = "duration"
-                break
-            if landed >= 2 and time.time() - self._last_publish_ts >= self.quiet_secs:
-                if not self.facilitate or self._facilitator_pumps >= self.facilitator_budget:
-                    self.stopped_by = "quiet"
-                    break
-                self._facilitator_pump(messages)
-                continue
-            if self.summarizer_backend is not None and landed - self._summarized_through > self.window_size + 4:
-                self._summarize(messages)
-            time.sleep(min(self.interval, 0.5))
+        # Always have a hard deadline: --minutes wins when set, otherwise a
+        # wall-clock backstop derived from quiet_secs bounds the run so a dead
+        # LLM cannot hang the CLI forever.
+        deadlines: List[tuple[float, str]] = []
+        if self.minutes > 0:
+            deadlines.append((started + (self.minutes * 60.0), "duration"))
+        if self.max_wall_secs > 0:
+            deadlines.append((started + self.max_wall_secs, "max_wall_secs"))
+        elif self.minutes == 0:
+            deadlines.append((started + self._derived_wall_secs(), "max_wall_secs"))
+        deadline, deadline_reason = min(deadlines, key=lambda item: item[0])
 
-        self._stop.set()
-        for agent in self.agents:
-            agent.stop.set()
-        for thread in threads:
-            thread.join(timeout=3.0)
+        try:
+            while not self._stop.is_set():
+                if self._budget_reached:
+                    self.stopped_by = "max_messages"
+                    break
+                if self._all_agreed():
+                    self.stopped_by = "consensus"
+                    break
+                now = time.time()
+                if now >= deadline:
+                    self.stopped_by = deadline_reason
+                    if deadline_reason == "max_wall_secs" and not self._last_agent_reply_ts:
+                        self.stopped_by = "stalled"
+                    break
+                if self._backend_failure_streak >= self._failure_limit():
+                    self.stopped_by = "backend_failure"
+                    break
+                messages = self._read_messages()
+                landed = len(messages)
+                if landed >= 2 and time.time() - self._last_publish_ts >= self.quiet_secs:
+                    if not self.facilitate or self.facilitator_backend is None:
+                        # Never busy-spin: no facilitator backend means quiet.
+                        self.stopped_by = "quiet"
+                        break
+                    if self._facilitator_attempts >= self.facilitator_budget:
+                        self.stopped_by = "quiet"
+                        break
+                    self._facilitator_pump(messages)
+                    time.sleep(min(self.interval, 0.5))
+                    continue
+                if self.summarizer_backend is not None and landed - self._summarized_through > self.window_size + 4:
+                    self._summarize(messages)
+                time.sleep(min(self.interval, 0.5))
+        finally:
+            self._stop.set()
+            for agent in self.agents:
+                agent.stop.set()
+            for thread in threads:
+                thread.join(timeout=3.0)
+
+        if self.stopped_by == "unknown":
+            self.stopped_by = "stopped"
         return {
-            "status": "ok",
+            "status": "ok" if self.stopped_by != "backend_failure" else "error",
             "room_id": self.room_id,
             "thread_id": self.thread_id,
             "stopped_by": self.stopped_by,
+            "elapsed_secs": round(time.time() - started, 3),
+            "backend_failures": self._backend_failures_total,
             "messages": list(self.messages),
             "message_count": len(self.messages),
         }
@@ -425,6 +505,9 @@ class ChatCoordinator:
         """Revive a quiet room with a facilitator question or challenge."""
         if self.facilitator_backend is None:
             return
+        # Count the attempt before calling the backend so a failing facilitator
+        # still exhausts its budget instead of spinning forever.
+        self._facilitator_attempts += 1
         history = self._render_for_agent(messages)
         prompt = (
             "You are the FACILITATOR of a realtime agent debate.\n"
@@ -436,16 +519,27 @@ class ChatCoordinator:
         try:
             text = self.facilitator_backend(prompt)
             text = _trim_reply(text, 30)
-            self._facilitator_pumps += 1
             self.publish(text, agent="facilitator")
+            self._facilitator_pumps += 1
+            self._record_backend_success()
             print(f"[facilitator] {text}", flush=True)
         except Exception as exc:
+            self._record_backend_failure()
             print(f"[facilitator] error: {exc}", flush=True)
 
 
 def build_runtime(base_dir: Optional[str], storage_format: Optional[str]) -> AgentMemoryRuntime:
     settings = EvidenceSpineSettings.from_env(base_dir=str(base_dir or ".evidencespine"), storage_format=storage_format)
     return AgentMemoryRuntime(config=settings.to_runtime_config())
+
+
+def _echo_backend(role: str) -> Callable[[str], str]:
+    """Hermetic backend used by ``--llm echo``; labels each reply by its role."""
+
+    def _echo(prompt: str) -> str:
+        return f"{role} echoes: message received"
+
+    return _echo
 
 
 def run_chat(
@@ -468,15 +562,19 @@ def run_chat(
     facilitator_budget: int = 3,
     summarize: bool = True,
     timeout: int = 180,
+    max_wall_secs: float = 0.0,
 ) -> Dict[str, Any]:
     """Run a realtime multi-agent chat on a shared spine room."""
     runtime = build_runtime(base_dir, storage_format)
     try:
+        # Only the real opencode LLM needs summarizer/facilitator subprocesses;
+        # echo/scripted runs must stay hermetic (no binary spawned, no hangs).
+        use_opencode_llm = llm == "opencode"
         summarizer_backend = None
         facilitator_backend = None
-        if summarize and llm != "scripted":
+        if summarize and use_opencode_llm:
             summarizer_backend = opencode_backend(directory=directory, timeout=timeout)
-        if facilitate and llm != "scripted":
+        if facilitate and use_opencode_llm:
             facilitator_backend = opencode_backend(directory=directory, timeout=timeout)
         coordinator = ChatCoordinator(
             runtime,
@@ -493,14 +591,15 @@ def run_chat(
             facilitator_budget=facilitator_budget,
             summarizer_backend=summarizer_backend,
             facilitator_backend=facilitator_backend,
+            max_wall_secs=max_wall_secs,
         )
         for role in roles:
             if llm == "scripted":
                 backend = scripted_backend({role: [f"{role} says: agreed in principle"]})
             elif llm == "echo":
-                def _echo(prompt: str) -> str:
-                    return f"{role} echoes: message received"
-                backend = _echo
+                # Bind the role per closure construction: a late-bound loop
+                # variable labeled every echo with the last role name.
+                backend = _echo_backend(role)
             else:
                 backend = opencode_backend(directory=directory, timeout=timeout)
             coordinator.add_agent(role, DEFAULT_PERSONAS.get(role, _default_persona(role)), backend)

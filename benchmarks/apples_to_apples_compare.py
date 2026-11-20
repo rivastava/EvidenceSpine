@@ -92,6 +92,43 @@ def _mk_event(i: int) -> Dict[str, Any]:
     }
 
 
+def _mk_probe_event(claim: str, fact_state: str, *, source_id: str, line: int = 1) -> Dict[str, Any]:
+    """Build a probe event whose evidence item carries a real checksummed excerpt.
+
+    The verified-probe must survive the verified-requires-span policy: a bare
+    'verified' fact_state with only an evidence_ref is downgraded to asserted
+    by the runtime, which made the published probe hit invalid.
+    """
+    excerpt = claim
+    checksum = f"sha256:{hashlib.sha256(excerpt.encode('utf-8')).hexdigest()}"
+    ref = f"{source_id}#L{line}-L{line}"
+    return {
+        "thread_id": "bench_thread",
+        "event_type": "outcome",
+        "role": "auditor",
+        "source_agent_id": "bench_probe",
+        "source_turn_id": f"probe_{fact_state}",
+        "payload": {
+            "claim": claim,
+            "fact_state": fact_state,
+        },
+        "evidence_refs": [ref],
+        "evidence_items": [
+            {
+                "source_id": source_id,
+                "locator": ref,
+                "line_start": line,
+                "line_end": line,
+                "excerpt": excerpt,
+                "checksum": checksum,
+                "verification_state": fact_state,
+            }
+        ],
+        "confidence": 0.8,
+        "salience": 0.8,
+    }
+
+
 def _mk_query(i: int) -> str:
     return f"what changed in segment_{i % 13} and target_{i % 11}?"
 
@@ -886,40 +923,12 @@ def _evaluate_runner(runner: Runner, *, events: int, queries: int, handoffs: int
     handoff_total_ms = (time.perf_counter() - t2) * 1000.0
 
     # Probe checks: verify whether runners preserve semantic state quality.
+    # The verified probe is a real checksummed evidence item so it survives the
+    # verified-requires-span policy instead of being downgraded to asserted.
     verified_probe = "probe_verified_claim_token"
     contradicted_probe = "probe_contradicted_claim_token"
-    runner.ingest(
-        {
-            "thread_id": "bench_thread",
-            "event_type": "outcome",
-            "role": "auditor",
-            "source_agent_id": "bench_probe",
-            "source_turn_id": "probe_verified",
-            "payload": {
-                "claim": verified_probe,
-                "fact_state": "verified",
-            },
-            "evidence_refs": ["bench/probe_verified.md#L1"],
-            "confidence": 0.8,
-            "salience": 0.8,
-        }
-    )
-    runner.ingest(
-        {
-            "thread_id": "bench_thread",
-            "event_type": "outcome",
-            "role": "auditor",
-            "source_agent_id": "bench_probe",
-            "source_turn_id": "probe_contradicted",
-            "payload": {
-                "claim": contradicted_probe,
-                "fact_state": "contradicted",
-            },
-            "evidence_refs": ["bench/probe_contradicted.md#L1"],
-            "confidence": 0.8,
-            "salience": 0.8,
-        }
-    )
+    runner.ingest(_mk_probe_event(verified_probe, "verified", source_id="bench/probe_verified.md"))
+    runner.ingest(_mk_probe_event(contradicted_probe, "contradicted", source_id="bench/probe_contradicted.md"))
     probe_brief = runner.brief(f"{verified_probe} {contradicted_probe}")
     p_recent_verified = probe_brief.get("recent_verified_facts", []) if isinstance(probe_brief, dict) else []
     p_active_risks = probe_brief.get("active_risks", []) if isinstance(probe_brief, dict) else []
@@ -968,6 +977,72 @@ def _evaluate_runner(runner: Runner, *, events: int, queries: int, handoffs: int
     )
 
 
+_AGGREGATE_METRICS: List[str] = [
+    "ingest_total_ms",
+    "ingest_eps",
+    "ingest_p50_ms",
+    "ingest_p95_ms",
+    "brief_total_ms",
+    "brief_qps",
+    "brief_p50_ms",
+    "brief_p95_ms",
+    "handoff_total_ms",
+    "handoff_qps",
+    "handoff_p50_ms",
+    "handoff_p95_ms",
+    "brief_claim_citation_coverage",
+    "brief_claim_ref_citation_coverage",
+    "brief_claim_span_citation_coverage",
+    "brief_claim_excerpt_fidelity",
+    "handoff_completeness_rate",
+    "handoff_claim_span_grounding_rate",
+    "handoff_checksum_rate",
+    "verified_probe_hit",
+    "contradiction_probe_hit",
+    "governance_score",
+]
+
+_SIGNIFICANT_METRICS: List[str] = [
+    "ingest_eps",
+    "brief_qps",
+    "handoff_qps",
+    "brief_claim_span_citation_coverage",
+    "brief_claim_excerpt_fidelity",
+    "handoff_claim_span_grounding_rate",
+    "verified_probe_hit",
+    "contradiction_probe_hit",
+    "governance_score",
+]
+
+
+def _aggregate_runner_runs(runs: Sequence[Dict[str, Any]], *, seeds: Sequence[int]) -> Dict[str, Any]:
+    """Aggregate per-seed runner metrics into mean/p50/p95 values."""
+    base_row = dict(runs[0])
+    statuses = {str(run.get("status", "")) for run in runs}
+    if statuses == {"skipped"}:
+        base_row["seeds"] = [int(s) for s in seeds]
+        base_row["runs"] = len(runs)
+        return base_row
+    aggregates: Dict[str, Dict[str, float]] = {}
+    for metric in _AGGREGATE_METRICS:
+        values = [float(run.get(metric, 0.0) or 0.0) for run in runs]
+        mean = float(sum(values) / max(1, len(values)))
+        aggregates[metric] = {
+            "mean": round(mean, 6),
+            "p50": round(_q(values, 0.50), 6),
+            "p95": round(_q(values, 0.95), 6),
+        }
+        base_row[metric] = round(mean, 6)
+    snapshots = [run.get("snapshot") for run in runs if isinstance(run.get("snapshot"), dict) and run.get("snapshot")]
+    base_row["status"] = "ok"
+    base_row["reason"] = ""
+    base_row["seeds"] = [int(s) for s in seeds]
+    base_row["runs"] = len(runs)
+    base_row["aggregates"] = aggregates
+    base_row["snapshot"] = dict(snapshots[0]) if snapshots else {}
+    return base_row
+
+
 def _write_markdown(payload: Dict[str, Any], path: Path) -> None:
     rows = payload.get("results", []) if isinstance(payload.get("results", []), list) else []
     lines: List[str] = []
@@ -978,6 +1053,10 @@ def _write_markdown(payload: Dict[str, Any], path: Path) -> None:
     lines.append(f"- queries: {params.get('queries')}")
     lines.append(f"- handoffs: {params.get('handoffs')}")
     lines.append(f"- seed: {params.get('seed')}")
+    seeds = params.get("seeds") if isinstance(params.get("seeds"), list) else []
+    multi_seed = len(seeds) > 1
+    if multi_seed:
+        lines.append(f"- seeds: {', '.join(str(s) for s in seeds)} (aggregated: mean of per-seed runs; p50/p95 across seeds)")
     lines.append("")
     lines.append("| runner | status | ingest eps | brief qps | handoff qps | brief ref coverage | brief span coverage | excerpt fidelity | handoff completeness | handoff span grounding |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
@@ -1009,6 +1088,27 @@ def _write_markdown(payload: Dict[str, Any], path: Path) -> None:
                 gs=float(row.get("governance_score", 0.0) or 0.0),
             )
         )
+    if multi_seed:
+        lines.append("")
+        lines.append("## Multi-seed aggregates (mean / p50 / p95 across seeds)")
+        lines.append("")
+        lines.append("| runner | metric | mean | p50 | p95 |")
+        lines.append("|---|---|---:|---:|---:|")
+        for row in rows:
+            aggregates = row.get("aggregates") if isinstance(row.get("aggregates"), dict) else {}
+            for metric in _SIGNIFICANT_METRICS:
+                agg = aggregates.get(metric) if isinstance(aggregates.get(metric), dict) else {}
+                if not agg:
+                    continue
+                lines.append(
+                    "| {runner} | {metric} | {mean:.4f} | {p50:.4f} | {p95:.4f} |".format(
+                        runner=str(row.get("runner", "")),
+                        metric=metric,
+                        mean=float(agg.get("mean", 0.0) or 0.0),
+                        p50=float(agg.get("p50", 0.0) or 0.0),
+                        p95=float(agg.get("p95", 0.0) or 0.0),
+                    )
+                )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1019,6 +1119,11 @@ def main() -> int:
     parser.add_argument("--queries", type=int, default=80)
     parser.add_argument("--handoffs", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seeds",
+        default="",
+        help="comma-separated seeds (e.g. 42,43,44); repeats each runner per seed and aggregates mean/p50/p95 (default: single --seed run)",
+    )
     parser.add_argument(
         "--runners",
         default="evidencespine_lexical,evidencespine_jsonl_lexical,evidencespine_hybrid,baseline_sqlite,mem0,letta",
@@ -1034,18 +1139,34 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
 
     requested = [x.strip().lower() for x in str(args.runners).split(",") if x.strip()]
+    seeds = [int(x.strip()) for x in str(args.seeds).split(",") if x.strip()] if str(args.seeds).strip() else [int(args.seed)]
+    if not seeds:
+        seeds = [int(args.seed)]
+    multi_seed = len(seeds) > 1
 
-    results: List[RunnerMetrics] = []
+    results: List[Dict[str, Any]] = []
+    per_seed_runs: List[Dict[str, Any]] = []
     for name in requested:
-        runner = _build_runner(name, root)
-        results.append(
-            _evaluate_runner(
-                runner,
-                events=int(max(100, args.events)),
-                queries=int(max(10, args.queries)),
-                handoffs=int(max(5, args.handoffs)),
+        runner_runs: List[Dict[str, Any]] = []
+        for seed in seeds:
+            random.seed(int(seed))
+            runner_root = (root / f"seed_{seed}") if multi_seed else root
+            runner = _build_runner(name, runner_root)
+            metrics = asdict(
+                _evaluate_runner(
+                    runner,
+                    events=int(max(100, args.events)),
+                    queries=int(max(10, args.queries)),
+                    handoffs=int(max(5, args.handoffs)),
+                )
             )
-        )
+            metrics["seed"] = int(seed)
+            runner_runs.append(metrics)
+        if multi_seed:
+            per_seed_runs.extend(runner_runs)
+            results.append(_aggregate_runner_runs(runner_runs, seeds=seeds))
+        else:
+            results.append(runner_runs[0])
 
     payload: Dict[str, Any] = {
         "benchmark": "apples_to_apples_v2",
@@ -1057,8 +1178,11 @@ def main() -> int:
             "seed": int(args.seed),
             "runners": requested,
         },
-        "results": [asdict(x) for x in results],
+        "results": results,
     }
+    if multi_seed:
+        payload["params"]["seeds"] = [int(s) for s in seeds]
+        payload["runs"] = per_seed_runs
 
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)

@@ -124,11 +124,19 @@ class JsonlStoreBackend(StoreBackend):
             lookback_hours=lookback_hours,
         )
 
-    def iter_events(self) -> Iterator[Dict[str, Any]]:
-        yield from jsonl_rows_reader(str(self.config.events_path))
+    def iter_events(self, thread_id: str = "") -> Iterator[Dict[str, Any]]:
+        target = safe_text(thread_id, "", 128)
+        for row in jsonl_rows_reader(str(self.config.events_path)):
+            if target and safe_text(row.get("thread_id"), "", 128) != target:
+                continue
+            yield row
 
-    def iter_facts(self) -> Iterator[Dict[str, Any]]:
-        yield from jsonl_rows_reader(str(self.config.facts_path))
+    def iter_facts(self, thread_id: str = "") -> Iterator[Dict[str, Any]]:
+        target = safe_text(thread_id, "", 128)
+        for row in jsonl_rows_reader(str(self.config.facts_path)):
+            if target and safe_text(row.get("thread_id"), "", 128) != target:
+                continue
+            yield row
 
     def count_events(self) -> int:
         if not str(self.config.events_path) or not os.path.exists(str(self.config.events_path)):

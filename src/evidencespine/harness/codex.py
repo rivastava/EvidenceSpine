@@ -1,75 +1,347 @@
-"""Codex harness delivery (`.codex/config.toml` + `.codex/hooks.json`).
+"""Codex harness delivery (.codex/config.toml + .codex/hooks.json).
 
-Codex surfaces (CLI, IDE extension, desktop) share MCP configuration; lifecycle
-hooks run from the session cwd with per-hash trust review via ``/hooks``.
+Codex surfaces (CLI, IDE extension, desktop app) share MCP + lifecycle-hook
+configuration. Primary sources (2026-11):
+learn.chatgpt.com/codex/{hooks,config-basic,config-reference,mcp}.md and
+learn.chatgpt.com/codex/guides/agents-md.md.
 
-Spec (developers.openai.com/codex/{mcp,config-basic,hooks}, guides/agents-md):
+* Config: ~/.codex/config.toml (user) and <repo>/.codex/config.toml (project,
+  trusted projects only). Precedence: CLI > project > profile > user.
+  MCP stdio shape: [mcp_servers.evidencespine] command="..." args=[...].
+  MCP HTTP shape: url + http_headers / bearer_token_env_var (auth).
+* Features: "hooks" is stable and default-on; declaring [features] hooks=true
+  is harmless. Appending a *second* [features] table is a TOML duplicate-key
+  error that invalidates the whole config, so the installer merges into the
+  existing table (or refuses to write an unparseable file).
+* Hooks: standalone .codex/hooks.json or inline [hooks]; locations
+  /etc/codex/hooks.json, $CODEX_HOME/hooks.json, <repo>/.codex/hooks.json.
+  Shape: {"hooks": {Event: [{matcher, hooks: [{type, command, timeout,
+  additionalContextLimit}]}]}}. Non-managed hooks require per-hash trust
+  review (/hooks or --dangerously-bypass-hook-trust).
+* Output contract: SessionStart/UserPromptSubmit plain-text stdout is added as
+  context; PreCompact/PostCompact support only the COMMON JSON output fields
+  (continue/stopReason/systemMessage/suppressOutput) - additionalContext is
+  NOT supported for PreCompact, so that hook is ingest-only. Post-compaction
+  recall rides SessionStart with matcher "" (sources include "compact").
+* AGENTS.md discovery: $CODEX_HOME/AGENTS.md first (never write it), then
+  project AGENTS.md/AGENTS.override.md root->cwd, one file per directory.
 
-* Config: ``~/.codex/config.toml`` (user) + ``<repo>/.codex/config.toml``
-  (project, trusted-only). Precedence CLI > project > profile > user.
-  MCP shape: ``[mcp_servers.evidencespine] command="..." args=[...]``.
-* Hooks: ``hooks.json`` OR inline ``[hooks]``/``[[hooks.Event]]`` in
-  ``config.toml``; locations ``~/.codex/`` + ``<repo>/.codex/`` (additive).
-  Events include SessionStart/SessionEnd/PreToolUse/PostToolUse/
-  PreCompact/PostCompact/UserPromptSubmit/Stop/SubagentStart/Stop.
-* Stdout: SessionStart/UserPromptSubmit plaintext is added as context;
-  all other events (notably PreCompact) MUST return
-  ``{"hookSpecificOutput": {"hookEventName": ..., "additionalContext": ...}}``.
-* Timeouts: default 600s; SessionEnd/Interrupt 1s default, 3s max.
-* Features: ``[features] hooks=true`` (stable; ``codex_hooks`` deprecated).
-* AGENTS.md: global ``~/.codex/AGENTS.md`` first, then git-root -> cwd,
-  cumulative ``project_doc_max_bytes`` = 32KiB.
-* MCP ``instructions`` is read on init; keep first 512 chars self-contained.
-
-Every hook fails open (never breaks the session).
+Every hook fails open (never breaks the session). precompact_envelope is kept
+as a compatibility shim returning the plain note (unsupported channel).
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import shlex
-from typing import Any, Dict, Optional
+import shutil
+from typing import Any, Dict, List, Optional, Tuple
+
+_MCP_TABLE_HEADER = "[mcp_servers.evidencespine]"
+_FEATURES_HEADER_RE = re.compile(r"^\s*\[\s*features\s*\]\s*(?:#.*)?$")
+_ANY_TABLE_RE = re.compile(r"^\s*\[")
+_HOOKS_LINE_RE = re.compile(r"^(\s*hooks\s*=\s*)([^#\n]+?)(\s*(?:#.*)?)$")
+
+#: SessionStart brief cap in tokens (Codex additionalContextLimit default 2500).
+SESSION_START_CONTEXT_LIMIT = 10000
 
 
-def hook_command(
-    executable: str,
-    action: str,
-    *,
-    base_dir: Optional[str] = None,
-) -> str:
-    """Build a shell-safe hook command for Codex hooks.json."""
-    parts = shlex.split(executable) if executable else ["evidencespine"]
+def split_executable(executable: str) -> List[str]:
+    """Split an executable into argv tokens (spaced paths stay one token)."""
+    text = str(executable or "").strip()
+    if not text:
+        return ["evidencespine"]
+    if os.path.exists(text):
+        return [text]
+    try:
+        argv = shlex.split(text)
+    except Exception:
+        return [text]
+    if len(argv) <= 1:
+        return argv or ["evidencespine"]
+    if shutil.which(argv[0]) is not None or os.path.exists(argv[0]):
+        return argv
+    return [text]
+
+
+def hook_command(executable: str, action: str, *, base_dir: Optional[str] = None) -> str:
+    """Build a shell-safe hook command string for Codex hooks.json.
+
+    Codex's hooks.json handler schema is a single command string (no exec-form
+    command+args pair), so argv tokens are escaped individually with
+    shlex.join; a multi-token executable such as "python3 -m evidencespine.cli"
+    survives correctly.
+    """
+    parts = split_executable(executable)
     parts += ["harness", "codex", action]
     if base_dir:
         parts += ["--base-dir", base_dir]
     return shlex.join(parts)
 
 
-def mcp_server_table(executable: str, base_dir: str) -> Dict[str, Any]:
-    """Return the ``[mcp_servers.evidencespine]`` table body."""
-    argv = shlex.split(executable) if executable else ["evidencespine"]
-    command = argv[0]
-    args = [*argv[1:], "mcp", "--base-dir", base_dir]
-    return {"command": command, "args": args}
+def mcp_server_table(
+    executable: str,
+    base_dir: str,
+    *,
+    mcp_url: Optional[str] = None,
+    bearer_token_env_var: Optional[str] = None,
+    http_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Return the [mcp_servers.evidencespine] table body (stdio or HTTP)."""
+    if mcp_url:
+        table: Dict[str, Any] = {"url": str(mcp_url)}
+        if bearer_token_env_var:
+            table["bearer_token_env_var"] = str(bearer_token_env_var)
+        if http_headers:
+            table["http_headers"] = {str(k): str(v) for k, v in http_headers.items()}
+        return table
+    argv = split_executable(executable)
+    return {"command": argv[0], "args": [*argv[1:], "mcp", "--base-dir", base_dir]}
 
 
-def render_config_toml(executable: str = "evidencespine", base_dir: str = ".evidencespine") -> str:
-    """Render a minimal ``.codex/config.toml`` snippet (MCP + features)."""
-    table = mcp_server_table(executable, base_dir)
+def render_mcp_table_toml(
+    executable: str = "evidencespine",
+    base_dir: str = ".evidencespine",
+    *,
+    mcp_url: Optional[str] = None,
+    bearer_token_env_var: Optional[str] = None,
+    http_headers: Optional[Dict[str, str]] = None,
+) -> str:
+    """Render just the [mcp_servers.evidencespine] TOML table."""
+    table = mcp_server_table(
+        executable,
+        base_dir,
+        mcp_url=mcp_url,
+        bearer_token_env_var=bearer_token_env_var,
+        http_headers=http_headers,
+    )
     lines = [
-        "# EvidenceSpine — Codex harness (generated by `evidencespine harness install --harness codex`)",
-        "# Project layer: <repo>/.codex/config.toml (requires trusted project).",
+        "# EvidenceSpine - Codex harness (generated by evidencespine harness install --harness codex)",
+        _MCP_TABLE_HEADER,
+    ]
+    lines.append(f"command = {json.dumps(table['command'], ensure_ascii=True)}")
+    lines.append(f"args = {json.dumps(table['args'], ensure_ascii=True)}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_http_mcp_table_toml(
+    mcp_url: str,
+    *,
+    bearer_token_env_var: Optional[str] = None,
+    http_headers: Optional[Dict[str, str]] = None,
+) -> str:
+    """Render the HTTP-transport [mcp_servers.evidencespine] TOML table."""
+    lines = [
+        "# EvidenceSpine - Codex harness (generated by evidencespine harness install --harness codex)",
+        _MCP_TABLE_HEADER,
+        f"url = {json.dumps(str(mcp_url), ensure_ascii=True)}",
+    ]
+    if bearer_token_env_var:
+        lines.append(f"bearer_token_env_var = {json.dumps(str(bearer_token_env_var), ensure_ascii=True)}")
+    if http_headers:
+        rendered = ", ".join(
+            f"{json.dumps(str(k), ensure_ascii=True)} = {json.dumps(str(v), ensure_ascii=True)}"
+            for k, v in http_headers.items()
+        )
+        lines.append(f"http_headers = {{ {rendered} }}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_config_toml(
+    executable: str = "evidencespine",
+    base_dir: str = ".evidencespine",
+    *,
+    mcp_url: Optional[str] = None,
+    bearer_token_env_var: Optional[str] = None,
+    http_headers: Optional[Dict[str, str]] = None,
+) -> str:
+    """Render a complete fresh .codex/config.toml (features + MCP)."""
+    if mcp_url:
+        body = render_http_mcp_table_toml(
+            mcp_url,
+            bearer_token_env_var=bearer_token_env_var,
+            http_headers=http_headers,
+        )
+    else:
+        body = render_mcp_table_toml(executable, base_dir)
+    lines = [
+        "# EvidenceSpine - Codex harness (generated by evidencespine harness install --harness codex)",
+        "# Project layer: <repo>/.codex/config.toml (requires a trusted project).",
         "# Global layer: ~/.codex/config.toml (same shape).",
         "",
         "[features]",
         "hooks = true",
         "",
-        "[mcp_servers.evidencespine]",
-        f"command = {json.dumps(table['command'], ensure_ascii=True)}",
-        f"args = {json.dumps(table['args'], ensure_ascii=True)}",
+        body.rstrip(),
         "",
     ]
     return "\n".join(lines)
+
+
+def _find_table_span(lines: List[str]) -> Optional[Tuple[int, int]]:
+    for index, line in enumerate(lines):
+        if _FEATURES_HEADER_RE.match(line):
+            end = len(lines)
+            for follow in range(index + 1, len(lines)):
+                if _ANY_TABLE_RE.match(lines[follow]):
+                    end = follow
+                    break
+            return index, end
+    return None
+
+
+def merge_features_text(text: str) -> Tuple[str, Dict[str, Any]]:
+    """Merge [features] hooks = true into TOML text without duplicating a table.
+
+    Inserts inside an existing [features] table (never a second header) and
+    flips an existing hooks = false to true. Returns (new_text, report).
+    """
+    report: Dict[str, Any] = {"changed": False, "action": "none", "warnings": []}
+    lines = str(text or "").splitlines()
+    had_trailing_newline = str(text or "").endswith("\n")
+    span = _find_table_span(lines)
+    if span is not None:
+        start, end = span
+        for index in range(start + 1, end):
+            match = _HOOKS_LINE_RE.match(lines[index])
+            if not match:
+                continue
+            value = match.group(2).strip().strip('"').strip("'").lower()
+            if value in {"false", "0", "no", "off"}:
+                lines[index] = f"{match.group(1)}true{match.group(3)}"
+                report.update({"changed": True, "action": "updated_false_to_true"})
+            else:
+                report.update({"action": "already_enabled"})
+            return "\n".join(lines) + ("\n" if had_trailing_newline else ""), report
+        lines.insert(end, "hooks = true")
+        report.update({"changed": True, "action": "inserted_into_features"})
+        return "\n".join(lines) + ("\n" if had_trailing_newline else ""), report
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.extend(["", "[features]", "hooks = true"])
+    report.update({"changed": True, "action": "appended_features_table"})
+    return "\n".join(lines) + "\n", report
+
+
+def _count_feature_headers(text: str) -> int:
+    return sum(1 for line in str(text or "").splitlines() if _FEATURES_HEADER_RE.match(line))
+
+
+def parse_toml(text: str) -> Tuple[Optional[bool], str]:
+    """Validate TOML text when tomllib is available (Python 3.11+)."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except Exception:
+        return None, ""
+    try:
+        tomllib.loads(str(text or ""))
+    except Exception as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def merge_config_toml(
+    existing: str,
+    *,
+    executable: str = "evidencespine",
+    base_dir: str = ".evidencespine",
+    mcp_url: Optional[str] = None,
+    bearer_token_env_var: Optional[str] = None,
+    http_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Merge the EvidenceSpine MCP + features config into existing TOML text.
+
+    Never overwrites an unparseable file and never appends a duplicate table.
+    Returns {"text", "status", "changed", "warnings", "features", "mcp_added"}.
+    """
+    original = str(existing or "")
+    payload: Dict[str, Any] = {
+        "text": original,
+        "status": "ok",
+        "changed": False,
+        "mcp_added": False,
+        "warnings": [],
+        "features": {},
+    }
+    if original.strip():
+        valid, error = parse_toml(original)
+        if valid is False:
+            payload.update({"status": "invalid", "warnings": [f"existing config.toml is not parseable TOML: {error}"]})
+            return payload
+        if valid is None:
+            # tomllib is unavailable (Python < 3.11): the file cannot be
+            # validated, so fail safe and never modify it. The installer
+            # reports "partial" and leaves a backup; users on 3.10 merge the
+            # table manually or run the installer on Python 3.11+.
+            payload.update(
+                {
+                    "status": "unvalidated",
+                    "warnings": [
+                        "existing config.toml cannot be validated without tomllib "
+                        "(Python 3.11+); left untouched"
+                    ],
+                }
+            )
+            return payload
+    text = original
+    if "[mcp_servers.evidencespine]" in [line.strip() for line in text.splitlines()]:
+        payload["mcp_added"] = False
+    else:
+        snippet = (
+            render_http_mcp_table_toml(
+                mcp_url or "",
+                bearer_token_env_var=bearer_token_env_var,
+                http_headers=http_headers,
+            )
+            if mcp_url
+            else render_mcp_table_toml(executable, base_dir)
+        )
+        text = text.rstrip("\n")
+        text = (text + "\n\n" if text else "") + snippet
+        payload["mcp_added"] = True
+        payload["changed"] = True
+    text, features_report = merge_features_text(text)
+    payload["features"] = features_report
+    payload["changed"] = bool(payload["changed"] or features_report.get("changed"))
+    if _count_feature_headers(text) > 1:
+        payload.update({"status": "invalid", "warnings": ["refusing to write duplicate [features] tables"]})
+        payload["text"] = original
+        return payload
+    if text.count(_MCP_TABLE_HEADER) > 1:
+        payload.update({"status": "invalid", "warnings": ["refusing to write duplicate MCP tables"]})
+        payload["text"] = original
+        return payload
+    valid, error = parse_toml(text)
+    if valid is False:
+        payload.update({"status": "invalid", "warnings": [f"merged config.toml would not parse: {error}"]})
+        payload["text"] = original
+        return payload
+    payload["text"] = text if text.endswith("\n") else text + "\n"
+    return payload
+
+
+def hook_entry(
+    executable: str,
+    action: str,
+    *,
+    base_dir: Optional[str] = None,
+    matcher: str = "",
+    timeout: int = 30,
+    context_limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """One Codex matcher group with a single command handler."""
+    handler: Dict[str, Any] = {
+        "type": "command",
+        "command": hook_command(executable, action, base_dir=base_dir),
+        "timeout": int(timeout),
+    }
+    if context_limit:
+        handler["additionalContextLimit"] = int(context_limit)
+    return {"matcher": matcher, "hooks": [handler]}
 
 
 def build_hooks_json(
@@ -77,42 +349,110 @@ def build_hooks_json(
     executable: str = "evidencespine",
     base_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build ``.codex/hooks.json`` wiring SessionStart/SessionEnd/PreCompact.
+    """Build .codex/hooks.json: SessionStart (all sources), SessionEnd, PreCompact.
 
-    SessionStart uses plaintext stdout (added as developer context).
-    SessionEnd is advisory (1s default timeout). PreCompact MUST use the
-    JSON envelope or stdout is ignored.
+    SessionStart uses plain-text stdout (added as developer context) and its
+    empty matcher covers the "compact" source, so post-compaction recall works
+    without PreCompact injection (which Codex does not support).
     """
-
-    def _entry(action: str, timeout: int) -> Dict[str, Any]:
-        return {
-            "matcher": "",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": hook_command(executable, action, base_dir=base_dir),
-                    "timeout": timeout,
-                }
-            ],
-        }
-
     return {
+        "description": (
+            "EvidenceSpine delivery: auto-recall at session start, retain through "
+            "pre-compaction, fast auto-retain at session end."
+        ),
         "hooks": {
-            "SessionStart": [_entry("session-start", 30)],
-            "SessionEnd": [_entry("session-stop", 3)],
-            "PreCompact": [_entry("precompact", 30)],
-        }
+            "SessionStart": [
+                hook_entry(
+                    executable,
+                    "session-start",
+                    base_dir=base_dir,
+                    matcher="",
+                    timeout=30,
+                    context_limit=SESSION_START_CONTEXT_LIMIT,
+                )
+            ],
+            # SessionEnd is sync, 1s default / 3s max in Codex.
+            "SessionEnd": [hook_entry(executable, "session-stop", base_dir=base_dir, timeout=3)],
+            # PreCompact JSON supports common fields only; stdout is ignored.
+            # The ingest side effect is the only supported behavior.
+            "PreCompact": [hook_entry(executable, "precompact", base_dir=base_dir, matcher="", timeout=30)],
+        },
     }
 
 
+def _commands_of(group: Any) -> List[str]:
+    commands: List[str] = []
+    if not isinstance(group, dict):
+        return commands
+    handlers = group.get("hooks")
+    for handler in handlers if isinstance(handlers, list) else []:
+        if isinstance(handler, dict) and handler.get("command"):
+            commands.append(str(handler["command"]))
+    return commands
+
+
+def _evidence_action(command: str) -> str:
+    """Deliverable action keyword of an EvidenceSpine hook command, if any."""
+    text = str(command or "")
+    if "evidencespine" not in text:
+        return ""
+    for action in ("session-start", "session-stop", "precompact", "compaction", "session_stop"):
+        if action in text:
+            return action
+    return "evidencespine"
+
+
+def merge_hooks_json(existing: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Append EvidenceSpine groups to an existing Codex hooks.json payload.
+
+    Groups are appended to existing event arrays (both run); a group whose
+    command already appears anywhere under the same event is skipped (dedupe).
+    Unrelated events/handlers are preserved. Returns {"payload", "report"}.
+    """
+    target: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    hooks = target.get("hooks")
+    hooks = dict(hooks) if isinstance(hooks, dict) else {}
+    report: Dict[str, Any] = {"appended_events": [], "skipped_events": [], "warnings": []}
+    source = payload.get("hooks") if isinstance(payload, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    known: set = set()
+    known_actions: set = set()
+    for event in hooks:
+        event_groups = hooks.get(event)
+        for group in event_groups if isinstance(event_groups, list) else []:
+            commands = _commands_of(group)
+            known.update(commands)
+            known_actions.update(_evidence_action(command) for command in commands)
+    for event, groups in source.items():
+        current = hooks.get(event)
+        current_list = list(current) if isinstance(current, list) else []
+        added = 0
+        for group in groups if isinstance(groups, list) else []:
+            commands = _commands_of(group)
+            actions = {_evidence_action(command) for command in commands}
+            if any(command in known for command in commands) or (actions & known_actions):
+                report["skipped_events"].append(event)
+                continue
+            current_list.append(group)
+            known.update(commands)
+            known_actions.update(actions)
+            added += 1
+        if added:
+            hooks[event] = current_list
+            report["appended_events"].append(event)
+        elif event not in hooks:
+            report["warnings"].append(f"{event}: no groups appended")
+    target["hooks"] = hooks
+    if isinstance(payload, dict) and payload.get("description") and not target.get("description"):
+        target["description"] = payload["description"]
+    return {"payload": target, "report": report}
+
+
 def precompact_envelope(note: str) -> str:
-    """Wrap a retain-through-compaction note in the Codex PreCompact envelope."""
-    return json.dumps(
-        {
-            "hookSpecificOutput": {
-                "hookEventName": "PreCompact",
-                "additionalContext": str(note or ""),
-            }
-        },
-        ensure_ascii=True,
-    )
+    """Deprecated: Codex PreCompact does not consume additionalContext.
+
+    Plain stdout is ignored as well; the hook exists for the ingest side effect
+    and post-compaction recall rides SessionStart with the "compact" source.
+    Kept as a compatibility shim returning the plain note.
+    """
+    return str(note or "")

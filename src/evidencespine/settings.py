@@ -7,11 +7,25 @@ from pathlib import Path
 from evidencespine.runtime import AgentMemoryRuntimeConfig
 
 
+_ENV_TRUE = {"1", "true", "yes", "on", "enable", "enabled"}
+_ENV_FALSE = {"0", "false", "no", "off", "disable", "disabled"}
+
+
 def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env flag.
+
+    Unrecognized values fall back to the caller's default instead of silently
+    becoming False (a typo must not disable fail-open or auth).
+    """
     raw = os.getenv(name)
     if raw is None:
         return bool(default)
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    text = str(raw).strip().lower()
+    if text in _ENV_TRUE:
+        return True
+    if text in _ENV_FALSE:
+        return False
+    return bool(default)
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -49,6 +63,8 @@ class EvidenceSpineSettings:
     brief_top_k_events: int = 32
     brief_top_k_facts: int = 24
     brief_recency_half_life_hours: float = 8.0
+    brief_lookback_hours: float = 168.0
+    state_flush_interval_sec: float = 1.0
     control_view_lookback_hours: float = 168.0
     verified_requires_span: bool = True
     retrieval_mode: str = "lexical"
@@ -58,6 +74,9 @@ class EvidenceSpineSettings:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     source_root: str = ""
     mcp_auth_token: str = ""
+    a2a_auth_token: str = ""
+    mcp_allow_unauthenticated: bool = False
+    a2a_allow_unauthenticated: bool = False
 
     @classmethod
     def from_env(cls, *, base_dir: str | None = None, storage_format: str | None = None) -> "EvidenceSpineSettings":
@@ -80,16 +99,21 @@ class EvidenceSpineSettings:
             brief_top_k_events=_env_int("EVIDENCESPINE_BRIEF_TOP_K_EVENTS", 32, 1),
             brief_top_k_facts=_env_int("EVIDENCESPINE_BRIEF_TOP_K_FACTS", 24, 1),
             brief_recency_half_life_hours=_env_float("EVIDENCESPINE_BRIEF_RECENCY_HALF_LIFE_HOURS", 8.0, 0.25),
+            brief_lookback_hours=_env_float("EVIDENCESPINE_BRIEF_LOOKBACK_HOURS", 168.0, 1.0),
+            state_flush_interval_sec=_env_float("EVIDENCESPINE_STATE_FLUSH_INTERVAL_SEC", 1.0, 0.0),
             control_view_lookback_hours=_env_float("EVIDENCESPINE_CONTROL_VIEW_LOOKBACK_HOURS", 168.0, 1.0),
             verified_requires_span=_env_bool("EVIDENCESPINE_VERIFIED_REQUIRES_SPAN", True),
-        retrieval_mode=retrieval_mode,
-        retrieval_lexical_weight=_env_float("EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT", 1.0, 0.0),
-        retrieval_vector_weight=_env_float("EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT", 0.35, 0.0),
-        embedding_backend=str(os.getenv("EVIDENCESPINE_EMBEDDING_BACKEND", "auto")).strip().lower(),
-        embedding_model=str(os.getenv("EVIDENCESPINE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")).strip(),
-        source_root=str(os.getenv("EVIDENCESPINE_SOURCE_ROOT", "")).strip(),
-        mcp_auth_token=str(os.getenv("EVIDENCESPINE_MCP_AUTH_TOKEN", "")).strip(),
-    )
+            retrieval_mode=retrieval_mode,
+            retrieval_lexical_weight=_env_float("EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT", 1.0, 0.0),
+            retrieval_vector_weight=_env_float("EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT", 0.35, 0.0),
+            embedding_backend=str(os.getenv("EVIDENCESPINE_EMBEDDING_BACKEND", "auto")).strip().lower(),
+            embedding_model=str(os.getenv("EVIDENCESPINE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")).strip(),
+            source_root=str(os.getenv("EVIDENCESPINE_SOURCE_ROOT", "")).strip(),
+            mcp_auth_token=str(os.getenv("EVIDENCESPINE_MCP_AUTH_TOKEN", "")).strip(),
+            a2a_auth_token=str(os.getenv("EVIDENCESPINE_A2A_AUTH_TOKEN", "")).strip(),
+            mcp_allow_unauthenticated=_env_bool("EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED", False),
+            a2a_allow_unauthenticated=_env_bool("EVIDENCESPINE_A2A_ALLOW_UNAUTHENTICATED", False),
+        )
 
     def to_runtime_config(self) -> AgentMemoryRuntimeConfig:
         base = Path(self.base_dir)
@@ -110,6 +134,8 @@ class EvidenceSpineSettings:
             brief_top_k_events=int(self.brief_top_k_events),
             brief_top_k_facts=int(self.brief_top_k_facts),
             brief_recency_half_life_hours=float(self.brief_recency_half_life_hours),
+            brief_lookback_hours=float(self.brief_lookback_hours),
+            state_flush_interval_sec=float(self.state_flush_interval_sec),
             control_view_lookback_hours=float(self.control_view_lookback_hours),
             verified_requires_span=bool(self.verified_requires_span),
             retrieval_mode=str(self.retrieval_mode),

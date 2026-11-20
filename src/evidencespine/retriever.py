@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from evidencespine.bm25 import Bm25Scorer
 from evidencespine.protocol import (
+    CITATION_LINE_MAX,
     AgentConversationBrief,
     ClaimCitation,
     freshness_state_for_context,
@@ -15,6 +16,7 @@ from evidencespine.protocol import (
     merge_evidence_refs,
     normalize_evidence_items,
     normalize_state_context,
+    normalize_verification,
     strip_inline_refs,
 )
 from evidencespine.vector_backends import VectorBackend
@@ -64,12 +66,61 @@ def _jaccard(a: Sequence[str], b: Sequence[str]) -> float:
     return float(len(sa.intersection(sb)) / max(1, len(sa.union(sb))))
 
 
+def _is_cjk_char(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x3000 <= cp <= 0x30FF  # CJK punctuation + kana
+        or 0x3400 <= cp <= 0x4DBF  # CJK ext A
+        or 0x4E00 <= cp <= 0x9FFF  # CJK unified ideographs
+        or 0xAC00 <= cp <= 0xD7AF  # Hangul syllables
+        or 0xF900 <= cp <= 0xFAFF  # CJK compatibility ideographs
+        or 0xFF00 <= cp <= 0xFFEF  # fullwidth forms
+    )
+
+
 def _estimate_tokens(text: str) -> int:
+    """Script-aware, deliberately conservative token estimate.
+
+    CJK characters are ~1 token each (English heuristics of chars/4 badly
+    undercount them); latin text uses max(words, chars/4), the higher of the
+    two common heuristics. Trimming must never overflow a real token budget.
+    """
     if not text:
         return 0
-    words = max(1, len(text.split()))
-    rough_chars = max(1, int(len(text) / 4))
-    return max(words, rough_chars)
+    cjk = 0
+    ascii_chars = 0
+    ascii_words = 0
+    in_word = False
+    for ch in text:
+        if _is_cjk_char(ch):
+            cjk += 1
+            in_word = False
+            continue
+        if ch.isspace():
+            in_word = False
+            continue
+        ascii_chars += 1
+        if not in_word:
+            ascii_words += 1
+            in_word = True
+    latin = max(ascii_words, (ascii_chars + 3) // 4)
+    return max(1, cjk + latin)
+
+
+def _cap_citation_line(line: str) -> str:
+    return str(line)[:CITATION_LINE_MAX]
+
+
+def _event_provenance(event: Dict[str, Any]) -> Dict[str, Any]:
+    payload = event.get("payload", {}) if isinstance(event.get("payload", {}), dict) else {}
+    verification = normalize_verification(payload.get("verification") or event.get("verification"))
+    metadata = event.get("metadata", {}) if isinstance(event.get("metadata", {}), dict) else {}
+    return {
+        "event_id": _safe_text(event.get("event_id"), "", 128),
+        "verification": dict(verification) if verification else None,
+        "evidence_stale": bool(payload.get("evidence_stale")) or bool(metadata.get("evidence_stale")),
+        "metadata": dict(metadata),
+    }
 
 
 @dataclass
@@ -268,7 +319,7 @@ class AgentMemoryRetriever:
             },
             fallback_ref=_safe_text(fallback_ref, "unknown_ref", 256),
         )
-        return f"{clean_claim} [ref:{citation.primary_ref}]", citation
+        return _cap_citation_line(f"{clean_claim} [ref:{citation.primary_ref}]"), citation
 
     def build_brief(
         self,
@@ -296,6 +347,7 @@ class AgentMemoryRetriever:
         open_items: List[str] = []
         next_actions: List[str] = []
         citations: Dict[str, ClaimCitation] = {}
+        provenance: Dict[str, Dict[str, Any]] = {}
 
         for event in top_events:
             payload = event.get("payload", {}) if isinstance(event.get("payload", {}), dict) else {}
@@ -313,6 +365,7 @@ class AgentMemoryRetriever:
                     )
                     current_goal.append(line)
                     citations[line] = citation
+                    provenance[line] = _event_provenance(event)
             if et == "decision":
                 decision = _safe_text(payload.get("decision", payload.get("claim", "")), "", 512)
                 if decision and not _is_superseded(decision):
@@ -325,6 +378,7 @@ class AgentMemoryRetriever:
                     )
                     locked_decisions.append(line)
                     citations[line] = citation
+                    provenance[line] = _event_provenance(event)
             if isinstance(payload.get("next_actions"), list):
                 for action in payload.get("next_actions", [])[:3]:
                     txt = _safe_text(action, "", 512)
@@ -339,6 +393,7 @@ class AgentMemoryRetriever:
                     )
                     next_actions.append(line)
                     citations[line] = citation
+                    provenance[line] = _event_provenance(event)
 
         for fact in top_facts:
             claim = _safe_text(fact.get("claim"), "", 1024)
@@ -355,16 +410,29 @@ class AgentMemoryRetriever:
             )
             citations[line] = citation
             fact_meta = fact.get("metadata", {}) if isinstance(fact.get("metadata", {}), dict) else {}
+            fact_verification = normalize_verification(fact_meta.get("verification") or fact.get("verification"))
+            provenance[line] = {
+                "fact_id": _safe_text(fact.get("fact_id"), "", 128),
+                "verification": dict(fact_verification) if fact_verification else None,
+                "evidence_stale": bool(fact_meta.get("evidence_stale")),
+                "metadata": dict(fact_meta),
+            }
             if bool(fact_meta.get("evidence_stale")):
-                risk_line = f"STALE EVIDENCE ({_safe_text(fact_meta.get('evidence_stale_reason'), 'changed', 16)}): {line}"
+                # Stale evidence is a risk, never a verified fact: it must not
+                # sit in recent_verified_facts or silently pass as open work.
+                reason = _safe_text(fact_meta.get("evidence_stale_reason"), "changed", 16)
+                risk_line = _cap_citation_line(f"STALE EVIDENCE ({reason}): {line}")
                 active_risks.append(risk_line)
                 citations[risk_line] = citation
+                provenance[risk_line] = dict(provenance[line])
+                continue
             if state == "verified":
                 recent_verified_facts.append(line)
             elif state == "contradicted":
-                risk_line = f"CONTRADICTION: {line}"
+                risk_line = _cap_citation_line(f"CONTRADICTION: {line}")
                 active_risks.append(risk_line)
                 citations[risk_line] = citation
+                provenance[risk_line] = dict(provenance[line])
             elif state == "asserted":
                 open_items.append(line)
 
@@ -381,9 +449,15 @@ class AgentMemoryRetriever:
                     _safe_text(row.get("claim", "contradiction"), "contradiction", 128),
                     state_context,
                 )
-                risk_line = f"CONTRADICTION: {line}"
+                risk_line = _cap_citation_line(f"CONTRADICTION: {line}")
                 active_risks.append(risk_line)
                 citations[risk_line] = citation
+                verification = normalize_verification(row.get("verification"))
+                provenance[risk_line] = {
+                    "verification": dict(verification) if verification else None,
+                    "evidence_stale": bool(row.get("evidence_stale")),
+                    "metadata": dict(row.get("metadata", {}) or {}) if isinstance(row.get("metadata", {}), dict) else {},
+                }
 
         ordered_sections = [
             ("current_goal", current_goal),
@@ -419,18 +493,23 @@ class AgentMemoryRetriever:
                 ]
         ordered_sections = [(name, deduped[name]) for name, _ in ordered_sections]
 
+        # Greedy fill in priority order: when a row does not fit, keep scanning
+        # the remaining (possibly cheaper/lower) rows instead of abandoning the
+        # section. Processing sections in priority order means high-priority
+        # sections (current_goal first) are never displaced by lower ones.
         used = 0
         trimmed: Dict[str, List[str]] = {name: [] for name, _ in ordered_sections}
         for name, rows in ordered_sections:
             for line in rows:
                 cost = _estimate_tokens(line)
                 if used + cost > budget:
-                    break
+                    continue
                 trimmed[name].append(line)
                 used += cost
 
         included_rows = set(sum(trimmed.values(), []))
         included_citations = {key: value for key, value in citations.items() if key in included_rows}
+        included_provenance = {key: value for key, value in provenance.items() if key in included_rows}
 
         now_ts = float(time.time())
         active_scope_ids: set[str] = set()
@@ -466,5 +545,8 @@ class AgentMemoryRetriever:
                 "active_scope_count": int(len(active_scope_ids)),
                 "open_gate_count": int(len(open_gate_scope_ids)),
                 "stale_scope_count": int(len(stale_scope_ids)),
+                # Provenance per citation line so emit_handoff can carry
+                # verification/staleness through the packet schema.
+                "provenance": included_provenance,
             },
         )
