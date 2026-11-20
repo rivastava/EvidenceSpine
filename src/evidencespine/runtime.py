@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from evidencespine.protocol import (
+    CITATION_LINE_MAX,
     AgentControlView,
     AgentConversationBrief,
     AgentHandoffPacket,
@@ -27,6 +28,7 @@ from evidencespine.protocol import (
     normalize_state_context,
     normalize_verification,
     parse_ts_value,
+    refresh_event_identity,
     safe_int,
     strip_inline_refs,
     safe_text,
@@ -41,6 +43,21 @@ from evidencespine.vector_backends import (
     HashingVectorBackend,
     VectorBackend,
 )
+
+
+CONTROL_VIEWS = ("active_scopes", "my_work", "open_gates", "stale_claims", "contradictions")
+_CONTROL_VIEW_ALIASES: Dict[str, str] = {name: name for name in CONTROL_VIEWS}
+_CONTROL_VIEW_ALIASES.update({name.replace("_", "-"): name for name in CONTROL_VIEWS})
+
+
+def normalize_control_view(view: Any) -> str:
+    """Map a requested view name (documented or hyphen alias) to canonical form.
+
+    Returns an empty string for unknown views so callers can fail open with a
+    structured invalid result instead of silently falling back to active_scopes.
+    """
+    requested = safe_text(view, "", 64).strip().lower()
+    return _CONTROL_VIEW_ALIASES.get(requested, "")
 
 
 @dataclass
@@ -61,6 +78,8 @@ class AgentMemoryRuntimeConfig:
     brief_top_k_events: int = 32
     brief_top_k_facts: int = 24
     brief_recency_half_life_hours: float = 8.0
+    brief_lookback_hours: float = 168.0
+    state_flush_interval_sec: float = 1.0
     retrieval_mode: str = "lexical"  # lexical | hybrid | vector
     retrieval_lexical_weight: float = 1.0
     retrieval_vector_weight: float = 0.35
@@ -79,16 +98,54 @@ class RuntimeHooks:
     reconcile_state: Optional[Callable[[str, List[Dict[str, Any]]], List[Dict[str, Any]]]] = None
 
 
+def _cap_claim_line(value: Any) -> str:
+    """Cap a brief claim line exactly like on-disk brief serialization does."""
+    return safe_text(value, "", CITATION_LINE_MAX)
+
+
 def _brief_sections(brief: AgentConversationBrief | Dict[str, Any]) -> List[List[str]]:
     payload = brief.to_dict() if isinstance(brief, AgentConversationBrief) else dict(brief or {})
-    return [
-        payload.get("current_goal", []) if isinstance(payload.get("current_goal", []), list) else [],
-        payload.get("locked_decisions", []) if isinstance(payload.get("locked_decisions", []), list) else [],
-        payload.get("recent_verified_facts", []) if isinstance(payload.get("recent_verified_facts", []), list) else [],
-        payload.get("active_risks", []) if isinstance(payload.get("active_risks", []), list) else [],
-        payload.get("open_items", []) if isinstance(payload.get("open_items", []), list) else [],
-        payload.get("next_actions", []) if isinstance(payload.get("next_actions", []), list) else [],
-    ]
+    sections: List[List[str]] = []
+    for key in (
+        "current_goal",
+        "locked_decisions",
+        "recent_verified_facts",
+        "active_risks",
+        "open_items",
+        "next_actions",
+    ):
+        rows = payload.get(key, [])
+        sections.append([_cap_claim_line(x) for x in rows if _cap_claim_line(x)] if isinstance(rows, list) else [])
+    return sections
+
+
+def _apply_verified_policy(facts: List[Dict[str, Any]], *, verified_requires_span: bool) -> int:
+    """Enforce verified-requires-span on derived facts; returns downgrade count.
+
+    Shared by ingest_event (event-derived fact candidates) and append_fact
+    (raw fact rows) so both entrypoints apply identical grounding policy.
+    """
+    if not bool(verified_requires_span):
+        return 0
+    downgrades = 0
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        if safe_text(fact.get("state"), "asserted", 32).lower() != "verified":
+            continue
+        metadata = fact.get("metadata", {}) if isinstance(fact.get("metadata", {}), dict) else {}
+        verification = metadata.get("verification") or fact.get("verification")
+        if is_grounded_claim(fact.get("evidence_items"), verification):
+            continue
+        fact["state"] = "asserted"
+        meta = dict(metadata)
+        meta["policy"] = "verified_requires_span"
+        fact["metadata"] = meta
+        downgrades += 1
+    return downgrades
+
+
+_IMPORT_ERROR_CAP = 20
 
 
 def _claim_citation(citations: Dict[str, Any], claim: str) -> ClaimCitation:
@@ -155,13 +212,15 @@ def _is_live_status(status: str) -> bool:
 def _control_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     by_state_kind: Dict[str, int] = {}
     by_status: Dict[str, int] = {}
-    seen_scope_ids: set[str] = set()
+    seen_scope_ids: set[tuple[str, str]] = set()
     for row in rows:
         state_context = normalize_state_context(row.get("state_context")) if isinstance(row, dict) and "state_context" in row else {}
         scope_id = safe_text(row.get("scope_id", state_context.get("scope_id")), "", 256)
-        if not scope_id or scope_id in seen_scope_ids:
+        thread_id = safe_text(row.get("thread_id", state_context.get("thread_id")), "", 128)
+        key = (thread_id, scope_id)
+        if not scope_id or key in seen_scope_ids:
             continue
-        seen_scope_ids.add(scope_id)
+        seen_scope_ids.add(key)
         state_kind = safe_text(row.get("state_kind", state_context.get("state_kind")), "", 64)
         status = safe_text(row.get("status", state_context.get("status")), "", 64)
         if state_kind:
@@ -211,6 +270,7 @@ class AgentMemoryRuntime:
                 dedupe_window_sec=float(max(60.0, float(self.config.dedupe_window_sec))),
                 redaction_enable=bool(self.config.redaction_enable),
                 fail_open=bool(self.config.fail_open),
+                state_flush_interval_sec=float(max(0.0, float(self.config.state_flush_interval_sec))),
             )
         )
         self.retriever = AgentMemoryRetriever(
@@ -245,13 +305,9 @@ class AgentMemoryRuntime:
         return HashingVectorBackend()
 
     def _record_fail_open(self, scope: str, reason: str) -> None:
-        self.store.state["fail_open_events_total"] = int(max(0, int(self.store.state.get("fail_open_events_total", 0)))) + 1
-        self.store.state["last_fail_open"] = {
-            "scope": safe_text(scope, "unknown", 128),
-            "reason": safe_text(reason, "", 512),
-            "ts": utc_now_iso(),
-        }
-        self.store.flush()
+        # Store helper increments the cumulative counter, appends the bounded
+        # fail_open_ts ring used by the 24h snapshot metric, and force-flushes.
+        self.store.record_fail_open(scope, reason)
 
     def _run_contradiction_pass(self, query: str, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         fn = self.hooks.contradiction_pass
@@ -339,13 +395,15 @@ class AgentMemoryRuntime:
         if not candidates:
             return []
         superseded_ids = {safe_text(item.get("supersedes_ref"), "", 128) for item in candidates if safe_text(item.get("supersedes_ref"), "", 128)}
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        # Group by (thread_id, scope_id): the same scope id in two threads is
+        # two distinct live rows, not one merged row.
+        grouped: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
         for item in candidates:
             row = item["row"]
-            grouped.setdefault(row.scope_id, []).append(item)
+            grouped.setdefault((safe_text(row.thread_id, "", 128), row.scope_id), []).append(item)
 
         resolved: List[ControlViewRow] = []
-        for scope_id, rows in grouped.items():
+        for _key, rows in grouped.items():
             active_rows = [item for item in rows if item["row"].source_record_id not in superseded_ids]
             if not active_rows:
                 active_rows = list(rows)
@@ -433,6 +491,13 @@ class AgentMemoryRuntime:
                     metadata=dict(payload.get("metadata", {}) or {}),
                 ).to_dict()
 
+            # Redact BEFORE validation/hash/derivation: the stored event, its
+            # hash identity, dedupe matching and derived fact candidates must
+            # all agree with what is actually persisted (store redaction then
+            # becomes a no-op on an already-redacted row).
+            row = self.store.redact_row(row)
+            row = refresh_event_identity(row)
+
             valid, errors = validate_event_dict(row)
             if not valid:
                 return {"status": "invalid", "errors": errors}
@@ -441,15 +506,9 @@ class AgentMemoryRuntime:
             policy_downgrades = 0
             if out.get("status") == "ok":
                 candidates = event_to_fact_candidates(row)
-                if bool(self.config.verified_requires_span):
-                    for fact in candidates:
-                        if safe_text(fact.get("state"), "asserted", 32).lower() != "verified":
-                            continue
-                        if is_grounded_claim(fact.get("evidence_items"), fact.get("metadata", {}).get("verification")):
-                            continue
-                        fact["state"] = "asserted"
-                        fact.setdefault("metadata", {})["policy"] = "verified_requires_span"
-                        policy_downgrades += 1
+                policy_downgrades = _apply_verified_policy(
+                    candidates, verified_requires_span=bool(self.config.verified_requires_span)
+                )
                 if candidates and any(
                     safe_text(fact.get("state"), "asserted", 32).lower() == "verified"
                     and not safe_text(fact.get("supersedes_fact_id"), "", 128)
@@ -478,6 +537,7 @@ class AgentMemoryRuntime:
                         state=safe_text(fact.get("state"), "asserted", 32),
                         source_agent_id=safe_text(fact.get("source_agent_id"), row.get("source_agent_id", "unknown"), 128),
                         source_turn_id=safe_text(fact.get("source_turn_id"), row.get("source_turn_id", ""), 128),
+                        ts_utc=safe_text(fact.get("ts_utc"), "", 64),
                         evidence_refs=normalize_refs(fact.get("evidence_refs")),
                         evidence_items=normalize_evidence_items(fact.get("evidence_items")),
                         state_context=(fact.get("state_context") if "state_context" in fact else None),
@@ -510,7 +570,10 @@ class AgentMemoryRuntime:
         self.store.state["brief_generation_attempts_total"] = int(max(0, int(self.store.state.get("brief_generation_attempts_total", 0)))) + 1
         stale = False
         try:
-            lookback_hours = max(1.0, (float(self.config.dedupe_window_sec) / 3600.0) * 3.0)
+            # Briefs are bounded by brief_lookback_hours (default 168h), not by
+            # the short dedupe window: recency ranking already bounds relevance,
+            # and older-but-important context must be eligible.
+            lookback_hours = max(1.0, float(self.config.brief_lookback_hours))
             events = self.store.list_recent_events(
                 thread_id=thread_id,
                 max_items=max(64, int(self.config.brief_top_k_events) * 6),
@@ -563,9 +626,14 @@ class AgentMemoryRuntime:
             latest_ts = 0.0
             for row in events:
                 latest_ts = max(latest_ts, parse_ts_value(row.get("ts")) or parse_ts_value(row.get("ts_utc")) or 0.0)
-            if latest_ts > 0.0:
+            # No events inside the lookback window means the memory is stale even
+            # when the store is non-empty (all rows are older than the window).
+            if not events:
+                stale = True
+            elif latest_ts > 0.0:
                 stale = bool((now_ts - latest_ts) > float(max(300.0, self.config.dedupe_window_sec)))
             brief.metadata["stale"] = bool(stale)
+            brief.metadata["lookback_hours"] = float(lookback_hours)
             brief.metadata["unresolved_contradictions"] = int(len(unresolved))
             self.store.write_brief(thread_id, brief.to_dict())
 
@@ -637,44 +705,78 @@ class AgentMemoryRuntime:
 
     def emit_handoff(self, role: str, thread_id: str, scope: str = "cross-agent coordination") -> AgentHandoffPacket:
         brief = self.build_brief(thread_id=thread_id, query=f"handoff for {role}")
+        citations = brief.citations if isinstance(brief.citations, dict) else {}
+        provenance_raw = (brief.metadata or {}).get("provenance")
+        provenance: Dict[str, Any] = provenance_raw if isinstance(provenance_raw, dict) else {}
+
+        def _provenance_fields(key: str) -> Dict[str, Any]:
+            candidate = provenance.get(key)
+            prov: Dict[str, Any] = candidate if isinstance(candidate, dict) else {}
+            verification = normalize_verification(prov.get("verification"))
+            metadata_raw = prov.get("metadata")
+            metadata: Dict[str, Any] = metadata_raw if isinstance(metadata_raw, dict) else {}
+            return {
+                "verification": dict(verification) if verification else None,
+                "evidence_stale": bool(prov.get("evidence_stale")),
+                "metadata": dict(metadata),
+            }
+
         claims: List[Dict[str, Any]] = []
-        for claim in list(brief.recent_verified_facts or [])[:24]:
-            citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
+        seen_claim_keys: set[str] = set()
+
+        def _add_claim(claim: str, status: str, *, provenance_key: str = "") -> Dict[str, Any] | None:
+            clean = safe_text(claim, "", CITATION_LINE_MAX)
+            if not clean:
+                return None
+            key = clean.strip().lower()
+            if key in seen_claim_keys:
+                return None
+            seen_claim_keys.add(key)
+            lookup = safe_text(provenance_key, "", CITATION_LINE_MAX) or clean
+            citation = _claim_citation(citations, lookup)
             row: Dict[str, Any] = {
-                "claim": claim,
+                "claim": clean,
                 "evidence_refs": list(citation),
                 "evidence_items": list(citation.evidence_items),
                 "span_grounded": bool(citation.span_grounded),
-                "status": "verified",
+                "status": status,
+                **_provenance_fields(lookup),
             }
             if citation.state_context is not None:
                 row["state_context"] = normalize_state_context(citation.state_context)
             claims.append(row)
+            return row
+
+        for verified_claim in list(brief.recent_verified_facts or [])[:24]:
+            _add_claim(verified_claim, "verified")
         if len(claims) == 0:
-            fallback_claims = list(brief.locked_decisions or []) + list(brief.open_items or [])
-            for claim in fallback_claims[:24]:
-                citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, claim)
-                row = {
-                    "claim": claim,
-                    "evidence_refs": list(citation),
-                    "evidence_items": list(citation.evidence_items),
-                    "span_grounded": bool(citation.span_grounded),
-                    "status": "asserted",
-                }
-                if citation.state_context is not None:
-                    row["state_context"] = normalize_state_context(citation.state_context)
-                claims.append(row)
+            for fallback_claim in (list(brief.locked_decisions or []) + list(brief.open_items or []))[:24]:
+                _add_claim(fallback_claim, "asserted")
+        # Stale evidence travels as asserted + evidence_stale=true, never as a
+        # verified claim (it must not re-import as verified).
+        for risk in list(brief.active_risks or [])[:24]:
+            risk_key = safe_text(risk, "", CITATION_LINE_MAX)
+            if not risk_key.startswith("STALE EVIDENCE"):
+                continue
+            inner = risk_key
+            if "): " in risk_key:
+                inner = risk_key.split("): ", 1)[1]
+            stale_row = _add_claim(inner, "asserted", provenance_key=risk_key)
+            if stale_row is not None:
+                stale_row["evidence_stale"] = True
         unresolved: List[Dict[str, Any]] = []
         for risk in list(brief.active_risks or [])[:24]:
-            if "CONTRADICTION" not in str(risk):
+            risk_key = safe_text(risk, "", CITATION_LINE_MAX)
+            if "CONTRADICTION" not in risk_key:
                 continue
-            citation = _claim_citation(brief.citations if isinstance(brief.citations, dict) else {}, str(risk))
-            row = {
-                "claim": str(risk),
+            citation = _claim_citation(citations, risk_key)
+            row: Dict[str, Any] = {
+                "claim": risk_key,
                 "reason": "unresolved_contradiction",
                 "evidence_refs": list(citation),
                 "evidence_items": list(citation.evidence_items),
                 "span_grounded": bool(citation.span_grounded),
+                **_provenance_fields(risk_key),
             }
             if citation.state_context is not None:
                 row["state_context"] = normalize_state_context(citation.state_context)
@@ -749,8 +851,10 @@ class AgentMemoryRuntime:
                     "metadata": {"packet_id": payload.get("packet_id"), "file_path": path},
                 }
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Self-ingest is best-effort, but a failure must still be visible
+            # (and force-flushed) rather than silently swallowed.
+            self._record_fail_open("emit_handoff_self_ingest", str(exc))
 
         if callable(self.hooks.on_handoff):
             try:
@@ -795,14 +899,17 @@ class AgentMemoryRuntime:
             "validations_imported": 0,
             "state_rows_imported": 0,
             "duplicates_skipped": 0,
+            "failed_ingests": 0,
         }
+        import_errors: List[Dict[str, Any]] = []
+        # Thread-filtered scan: only the importer thread is scanned for
+        # duplicate claims instead of the whole store.
         existing_fact_keys = {
             (
                 safe_text(fact.get("claim"), "", 2048).strip().lower(),
                 safe_text(fact.get("state"), "", 32).lower(),
             )
-            for fact in self.store.iter_facts()
-            if safe_text(fact.get("thread_id"), "", 128) == target_thread
+            for fact in self.store.iter_facts(thread_id=target_thread)
         }
         existing_live_claims = {
             claim
@@ -810,9 +917,13 @@ class AgentMemoryRuntime:
             if state in {"asserted", "verified"}
         }
 
-        def _counted(result: Dict[str, Any], key: str) -> None:
+        def _counted(result: Dict[str, Any], key: str, row_type: str = "", index: int = 0) -> None:
             if result.get("status") in {"ok", "deduped"}:
                 counts[key] = int(counts.get(key, 0)) + 1
+                return
+            counts["failed_ingests"] = int(counts.get("failed_ingests", 0)) + 1
+            if len(import_errors) < _IMPORT_ERROR_CAP:
+                import_errors.append({"row_type": row_type or key, "index": int(index), "result": dict(result or {})})
 
         decisions = packet.get("locked_decisions", []) if isinstance(packet.get("locked_decisions", []), list) else []
         for idx, decision in enumerate(decisions):
@@ -841,6 +952,8 @@ class AgentMemoryRuntime:
                     }
                 ),
                 "decisions_imported",
+                "locked_decisions",
+                idx,
             )
 
         for row_type in ("claims", "unresolved_contradictions"):
@@ -851,10 +964,16 @@ class AgentMemoryRuntime:
                 status = safe_text(row.get("status"), "", 32).lower()
                 if status not in {"verified", "asserted", "contradicted", "superseded"}:
                     status = "contradicted" if row_type == "unresolved_contradictions" else "asserted"
+                row_verification = normalize_verification(row.get("verification"))
+                row_metadata = row.get("metadata", {}) if isinstance(row.get("metadata", {}), dict) else {}
+                evidence_stale = bool(row.get("evidence_stale")) or bool(row_metadata.get("evidence_stale"))
                 if status == "verified" and bool(self.config.verified_requires_span) and not is_grounded_claim(
                     normalize_evidence_items(row.get("evidence_items")),
-                    normalize_verification(row.get("verification")),
+                    row_verification,
                 ):
+                    status = "asserted"
+                if evidence_stale and status == "verified":
+                    # Stale evidence may never re-import as verified.
                     status = "asserted"
                 clean_claim, inline_refs = strip_inline_refs(safe_text(row.get("claim"), "", 2048))
                 if not clean_claim:
@@ -872,6 +991,8 @@ class AgentMemoryRuntime:
                         "claim": clean_claim.strip(),
                         "fact_state": status,
                         "scope": scope,
+                        **({"verification": dict(row_verification)} if row_verification else {}),
+                        **({"evidence_stale": True} if evidence_stale else {}),
                     },
                     "evidence_refs": merge_evidence_refs(
                         merge_evidence_refs([*list(row.get("evidence_refs", []) or []), *inline_refs], None),
@@ -880,13 +1001,23 @@ class AgentMemoryRuntime:
                     "evidence_items": normalize_evidence_items(row.get("evidence_items")),
                     "confidence": 0.6,
                     "salience": 0.5,
-                    "metadata": {**base_metadata, "imported_row_type": row_type, "imported_row_index": idx},
+                    "metadata": {
+                        **base_metadata,
+                        "imported_row_type": row_type,
+                        "imported_row_index": idx,
+                        **({"evidence_stale": True} if evidence_stale else {}),
+                    },
                 }
                 state_context = normalize_state_context(row.get("state_context")) if "state_context" in row else {}
                 if state_context:
                     event["state_context"] = state_context
                 result = self.ingest_event(event)
-                _counted(result, "claims_imported" if row_type == "claims" else "contradictions_imported")
+                _counted(
+                    result,
+                    "claims_imported" if row_type == "claims" else "contradictions_imported",
+                    row_type,
+                    idx,
+                )
                 if state_context:
                     _counted(result, "state_rows_imported")
 
@@ -913,14 +1044,14 @@ class AgentMemoryRuntime:
         )
         if out.get("status") in {"ok", "deduped"}:
             counts["validations_imported"] = len(validations)
-        return {"status": "ok", "ingest": out, "packet_id": packet_id, **counts}
+        else:
+            _counted(out, "validations_imported", "required_validations", 0)
+        return {"status": "ok", "ingest": out, "packet_id": packet_id, "errors": import_errors, **counts}
 
     def _evidence_stale_rows(self, *, thread_id: str = "") -> List[ControlViewRow]:
         """Facts whose grounded evidence no longer matches the live file."""
         out: List[ControlViewRow] = []
-        for fact in self.store.iter_facts():
-            if thread_id and safe_text(fact.get("thread_id"), "", 128) != thread_id:
-                continue
+        for fact in self.store.iter_facts(thread_id=safe_text(thread_id, "", 128)):
             meta = fact.get("metadata", {}) if isinstance(fact.get("metadata", {}), dict) else {}
             if not bool(meta.get("evidence_stale")):
                 continue
@@ -960,10 +1091,28 @@ class AgentMemoryRuntime:
         limit: int = 50,
         lookback_hours: float | None = None,
     ) -> AgentControlView:
-        view_name = safe_text(view, "", 64)
+        requested_view = safe_text(view, "", 64)
         owner = safe_text(owner_agent_id, "", 128)
+        view_name = normalize_control_view(requested_view)
         if not bool(self.config.enabled):
-            return AgentControlView(view=view_name, thread_id=safe_text(thread_id, "", 128), owner_agent_id=owner)
+            return AgentControlView(
+                view=view_name or requested_view,
+                thread_id=safe_text(thread_id, "", 128),
+                owner_agent_id=owner,
+            )
+        if not view_name:
+            # Durable, fail-open validation shared by CLI/MCP/A2A/async surfaces.
+            return AgentControlView(
+                view=requested_view,
+                thread_id=safe_text(thread_id, "", 128),
+                owner_agent_id=owner,
+                rows=[],
+                metadata={
+                    "status": "invalid",
+                    "reason": "unknown_view",
+                    "valid_views": list(CONTROL_VIEWS),
+                },
+            )
 
         rows = self._resolved_control_rows(
             thread_id=safe_text(thread_id, "", 128),
@@ -992,6 +1141,7 @@ class AgentMemoryRuntime:
             owner_agent_id=owner,
             rows=rows,
             metadata={
+                "status": "ok",
                 "include_closed": bool(include_closed),
                 "limit": int(max(1, int(limit))),
                 "lookback_hours": float(self._lookback_hours(lookback_hours)),
@@ -1065,7 +1215,18 @@ class AgentMemoryRuntime:
         events = self.store.list_recent_events(max_items=max(256, int(self.config.max_event_tail)), lookback_hours=24.0)
         facts = self.store.list_recent_facts(max_items=max(256, int(self.config.max_event_tail)), lookback_hours=24.0)
 
-        verified_facts = [f for f in facts if str(f.get("state", "")).lower() == "verified"]
+        superseded_twin_ids = {
+            safe_text(f.get("supersedes_fact_id"), "", 128)
+            for f in facts
+            if safe_text(f.get("supersedes_fact_id"), "", 128)
+            and safe_text(f.get("supersedes_fact_id"), "", 128) != safe_text(f.get("fact_id"), "", 128)
+        }
+        verified_facts = [
+            f
+            for f in facts
+            if str(f.get("state", "")).lower() == "verified"
+            and safe_text(f.get("fact_id"), "", 128) not in superseded_twin_ids
+        ]
         verified_with_provenance = [
             f for f in verified_facts if isinstance(f.get("metadata"), dict) and f["metadata"].get("verification")
         ]
@@ -1091,6 +1252,7 @@ class AgentMemoryRuntime:
         citation_span_covered = 0
         citation_excerpt_total = 0
         citation_excerpt_covered = 0
+        brief_artifacts_unreadable = 0
         for path in brief_files[-1024:]:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
@@ -1116,12 +1278,14 @@ class AgentMemoryRuntime:
                         citation_excerpt_total += add_total
                         citation_excerpt_covered += add_covered
             except Exception:
+                brief_artifacts_unreadable += 1
                 continue
 
         handoff_recent = 0
         handoff_complete = 0
         handoff_span_total = 0
         handoff_span_covered = 0
+        handoff_artifacts_unreadable = 0
         for path in handoff_files[-1024:]:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
@@ -1147,6 +1311,7 @@ class AgentMemoryRuntime:
                     if _handoff_row_span_grounded(row_item):
                         handoff_span_covered += 1
             except Exception:
+                handoff_artifacts_unreadable += 1
                 continue
 
         active_view = self.query_view("active_scopes", include_closed=False, limit=max(1, int(self.config.max_event_tail)), lookback_hours=24.0).to_dict()
@@ -1157,6 +1322,17 @@ class AgentMemoryRuntime:
         freshness_covered = sum(1 for row in active_rows if safe_text((row or {}).get("freshness_state"), "", 16) != "unknown")
         stale_rows = sum(1 for row in active_rows if safe_text((row or {}).get("freshness_state"), "", 16) == "stale")
         conflict_rows = sum(1 for row in active_rows if bool((row or {}).get("conflict")))
+
+        fail_open_24h = 0
+        fail_open_ts_ring = self.store.state.get("fail_open_ts", [])
+        if isinstance(fail_open_ts_ring, list):
+            for raw_ts in fail_open_ts_ring:
+                try:
+                    if 0.0 <= (now_ts - float(raw_ts)) <= 86400.0:
+                        fail_open_24h += 1
+                except (TypeError, ValueError):
+                    continue
+        fail_open_total = int(max(0, int(self.store.state.get("fail_open_events_total", 0))))
 
         last_update_ts = safe_text(self.store.state.get("last_update_ts"), "", 64)
         state_age = None
@@ -1192,7 +1368,10 @@ class AgentMemoryRuntime:
             "agent_active_scope_stale_rate_24h": (float(stale_rows / max(1, len(active_rows))) if active_rows else 0.0),
             "agent_scope_conflict_rate_24h": (float(conflict_rows / max(1, len(active_rows))) if active_rows else 0.0),
             "agent_evidence_stale_count_24h": int(len(self._evidence_stale_rows())),
-            "agent_memory_fail_open_events_24h": int(max(0, int(self.store.state.get("fail_open_events_total", 0)))),
+            "agent_memory_fail_open_events_24h": int(fail_open_24h),
+            "agent_memory_fail_open_events_total": int(fail_open_total),
+            "brief_artifacts_unreadable": int(brief_artifacts_unreadable),
+            "handoff_artifacts_unreadable": int(handoff_artifacts_unreadable),
             "agent_memory_last_update_ts": last_update_ts or None,
             "agent_memory_state_age_sec": (float(max(0.0, state_age)) if state_age is not None else None),
         }
@@ -1230,6 +1409,10 @@ class AgentMemoryRuntime:
             row = dict(fact_row or {})
             if not safe_text(row.get("claim"), "", 4096):
                 return {"status": "invalid", "errors": ["missing:claim"]}
+            metadata = dict(row.get("metadata", {}) or {})
+            verification = normalize_verification(metadata.get("verification") or row.get("verification"))
+            if verification:
+                metadata["verification"] = dict(verification)
             fact = AgentMemoryFact(
                 fact_id=safe_text(row.get("fact_id"), "", 128),
                 thread_id=safe_text(row.get("thread_id"), "", 128),
@@ -1243,9 +1426,17 @@ class AgentMemoryRuntime:
                 confidence=float(row.get("confidence", 0.5)),
                 tags=list(row.get("tags", []) or []),
                 supersedes_fact_id=safe_text(row.get("supersedes_fact_id"), "", 128),
-                metadata=dict(row.get("metadata", {}) or {}),
+                metadata=metadata,
             ).to_dict()
-            return self.store.append_fact(fact)
+            # Same verified-requires-span policy as ingest_event.
+            policy_downgrades = _apply_verified_policy(
+                [fact], verified_requires_span=bool(self.config.verified_requires_span)
+            )
+            out = self.store.append_fact(fact)
+            if isinstance(out, dict):
+                out = dict(out)
+                out["policy_downgrades"] = int(policy_downgrades)
+            return out
         except Exception as exc:
             if bool(self.config.fail_open):
                 self._record_fail_open("append_fact", str(exc))
@@ -1311,55 +1502,139 @@ class AgentMemoryRuntime:
         thread_id: str = "",
         source_root: str = ".",
         dry_run: bool = True,
+        allow_absolute_source_id: bool = True,
     ) -> Dict[str, Any]:
         """Re-verify grounded evidence against live files.
 
-        For every fact carrying checksummed evidence items, re-read the source
-        file at the stored line range and compare the recomputed checksum.
-        Verdicts: ``changed`` (file drifted), ``missing`` (file unreadable or
-        range out of bounds). ``dry_run`` reports; ``dry_run=False`` writes
-        ``metadata.evidence_stale`` onto the fact. Fail-closed: only a
-        re-verified checksum clears; torn reads degrade to ``missing``.
+        Supports line anchors, character anchors (0-based start, inclusive end
+        over decoded UTF-8 text) and locator-only items parsed with
+        grounding.parse_ref. allow_absolute_source_id=False is the server-side
+        mode: absolute source ids are unverifiable and relative ids must
+        realpath-confine under source_root.
+
+        Verdicts: changed (file drifted), missing (file unreadable) and
+        unverifiable (unsupported/ambiguous anchor, out-of-range char span, or
+        a source id outside the allowed root). Unverifiable evidence never
+        marks a fact stale and never clears an existing stale flag.
+        dry_run reports; dry_run=False writes metadata.evidence_stale.
         """
-        from evidencespine.grounding import excerpt_checksum, read_lines
+        from evidencespine.grounding import excerpt_checksum, parse_ref, read_lines
 
         if not bool(self.config.enabled):
             return {"status": "disabled", "reason": "agent_memory_disabled"}
+
+        root_real = os.path.realpath(str(source_root or "."))
+
+        def _resolve_source(value: Any) -> str | None:
+            sid = safe_text(value, "", 512)
+            if not sid:
+                return None
+            if os.path.isabs(sid):
+                return sid if bool(allow_absolute_source_id) else None
+            full = os.path.realpath(os.path.join(root_real, sid))
+            if full != root_real and not full.startswith(root_real + os.sep):
+                return None
+            return full
+
+        def _read_text(path: str) -> str | None:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    return handle.read()
+            except OSError:
+                return None
+
+        def _matches(checksum: str, text: str) -> bool:
+            want = checksum.lower()
+            if want.startswith("sha256:"):
+                want = want[len("sha256:") :]
+            return excerpt_checksum(text) == f"sha256:{want}"
+
+        def _item_verdict(item: Dict[str, Any]) -> str | None:
+            excerpt = safe_text(item.get("excerpt"), "", 4096)
+            checksum = safe_text(item.get("checksum"), "", 256)
+            if not excerpt or not checksum:
+                return None
+            char_start = safe_int(item.get("char_start"), None, 0, None)
+            line_start = safe_int(item.get("line_start"), None, 1, None)
+            locator = safe_text(item.get("locator"), "", 512)
+            if char_start is not None and line_start is not None:
+                return "unverifiable"
+            if char_start is not None:
+                char_end = safe_int(item.get("char_end"), char_start, 0, None)
+                char_end = char_start if char_end is None or char_end < char_start else char_end
+                full = _resolve_source(item.get("source_id"))
+                if full is None:
+                    return "unverifiable"
+                body = _read_text(full)
+                if body is None:
+                    return "missing"
+                if char_start >= len(body) or char_end >= len(body):
+                    return "unverifiable"
+                return None if _matches(checksum, body[char_start : char_end + 1]) else "changed"
+            if line_start is not None:
+                line_end = safe_int(item.get("line_end"), line_start, 1, None)
+                line_end = line_start if line_end is None else max(line_start, line_end)
+                full = _resolve_source(item.get("source_id"))
+                if full is None:
+                    return "unverifiable"
+                lines = read_lines(full, line_start, line_end)
+                if lines is None:
+                    return "missing"
+                return None if _matches(checksum, "\n".join(lines)) else "changed"
+            if locator:
+                parsed = parse_ref(locator)
+                if parsed is None:
+                    return "unverifiable"
+                loc_path, loc_start, loc_end = parsed
+                full = _resolve_source(loc_path)
+                if full is None:
+                    return "unverifiable"
+                lines = read_lines(full, loc_start, loc_end)
+                if lines is None:
+                    return "missing"
+                return None if _matches(checksum, "\n".join(lines)) else "changed"
+            return "unverifiable"
+
         try:
-            root = str(source_root or ".")
             results: List[Dict[str, Any]] = []
             checked_items = 0
+            unverifiable_items = 0
             stale_facts = 0
             cleared_facts = 0
-            for fact in self.store.iter_facts():
-                if thread_id and safe_text(fact.get("thread_id"), "", 128) != thread_id:
-                    continue
+            target_thread = safe_text(thread_id, "", 128)
+            for fact in self.store.iter_facts(thread_id=target_thread):
                 fact_meta = fact.get("metadata", {}) if isinstance(fact.get("metadata", {}), dict) else {}
                 items = normalize_evidence_items(fact.get("evidence_items"))
-                verdict = None
+                verdict: str | None = None
+                fact_unverifiable = 0
                 source_id = ""
                 for item in items:
                     excerpt = safe_text(item.get("excerpt"), "", 4096)
                     checksum = safe_text(item.get("checksum"), "", 256)
                     if not excerpt or not checksum:
                         continue
+                    source_id = safe_text(item.get("source_id"), "", 512) or safe_text(item.get("locator"), "", 512)
+                    item_verdict = _item_verdict(item)
+                    if item_verdict == "unverifiable":
+                        fact_unverifiable += 1
+                        continue
                     checked_items += 1
-                    source_id = safe_text(item.get("source_id"), "", 512)
-                    line_start = int(safe_int(item.get("line_start"), 1, 1, None) or 1)
-                    line_end = int(safe_int(item.get("line_end"), line_start, 1, None) or line_start)
-                    full = source_id if os.path.isabs(source_id) else os.path.join(root, source_id)
-                    lines = read_lines(full, line_start, line_end)
-                    if lines is None:
-                        verdict = "missing"
-                    else:
-                        want = checksum.lower()
-                        if want.startswith("sha256:"):
-                            want = want[len("sha256:") :]
-                        digest = excerpt_checksum("\n".join(lines))
-                        verdict = None if digest == f"sha256:{want}" else "changed"
-                    if verdict is not None:
+                    if item_verdict is not None:
+                        verdict = item_verdict
                         break
+                unverifiable_items += fact_unverifiable
+                fact_id = safe_text(fact.get("fact_id"), "", 128)
+                row_base = {
+                    "fact_id": fact_id,
+                    "thread_id": safe_text(fact.get("thread_id"), "", 128),
+                    "claim": safe_text(fact.get("claim"), "", 2048),
+                    "state": safe_text(fact.get("state"), "asserted", 32).lower(),
+                }
                 if verdict is None:
+                    if fact_unverifiable:
+                        # Cannot re-verify and cannot clear: fail closed.
+                        results.append({**row_base, "source_id": source_id, "reason": "unverifiable"})
+                        continue
                     if bool(fact_meta.get("evidence_stale")):
                         cleared_facts += 1
                         cleared_meta = {
@@ -1369,7 +1644,7 @@ class AgentMemoryRuntime:
                         }
                         if not dry_run:
                             self.store.update_fact(
-                                safe_text(fact.get("fact_id"), "", 128),
+                                fact_id,
                                 {
                                     "metadata": {
                                         **cleared_meta,
@@ -1379,38 +1654,20 @@ class AgentMemoryRuntime:
                                     }
                                 },
                             )
-                        results.append(
-                            {
-                                "fact_id": safe_text(fact.get("fact_id"), "", 128),
-                                "thread_id": safe_text(fact.get("thread_id"), "", 128),
-                                "claim": safe_text(fact.get("claim"), "", 2048),
-                                "state": safe_text(fact.get("state"), "asserted", 32).lower(),
-                                "source_id": source_id,
-                                "reason": "cleared",
-                            }
-                        )
+                        results.append({**row_base, "source_id": source_id, "reason": "cleared"})
                     continue
                 stale_facts += 1
-                fact_id = safe_text(fact.get("fact_id"), "", 128)
                 meta = dict(fact.get("metadata", {}) or {})
                 meta["evidence_stale"] = True
                 meta["evidence_stale_reason"] = verdict
                 meta["evidence_stale_at"] = utc_now_iso()
                 if not dry_run:
                     self.store.update_fact(fact_id, {"metadata": meta})
-                results.append(
-                    {
-                        "fact_id": fact_id,
-                        "thread_id": safe_text(fact.get("thread_id"), "", 128),
-                        "claim": safe_text(fact.get("claim"), "", 2048),
-                        "state": safe_text(fact.get("state"), "asserted", 32).lower(),
-                        "source_id": source_id,
-                        "reason": verdict,
-                    }
-                )
+                results.append({**row_base, "source_id": source_id, "reason": verdict})
             return {
                 "status": "ok",
                 "checked_items": int(checked_items),
+                "unverifiable_items": int(unverifiable_items),
                 "stale_facts": int(stale_facts),
                 "cleared_facts": int(cleared_facts),
                 "dry_run": bool(dry_run),

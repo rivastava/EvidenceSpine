@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -85,7 +87,7 @@ def test_tool_ingest_brief_view_handoff_snapshot_flow(tmp_path: Path) -> None:
         result = await server.call_tool("build_brief", {"thread_id": "demo", "query": "deploy state"})
         assert '"recent_verified_facts"' in result.content[0].text
 
-        result = await server.call_tool("query_view", {"view": "active-scopes"})
+        result = await server.call_tool("query_view", {"view": "active-scopes", "thread_id": "demo"})
         assert '"scope_id": "release-gate"' in result.content[0].text
 
         result = await server.call_tool("emit_handoff", {"thread_id": "demo", "role": "auditor"})
@@ -249,6 +251,118 @@ def test_prompts_treat_placeholder_args_as_unset(tmp_path: Path) -> None:
         assert not any(n.startswith("$") for n in names), "placeholder args must not leak into brief names"
 
     _run(go())
+
+
+def test_control_view_resource_rejects_unknown_view_and_honors_aliases(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+
+    async def go() -> tuple[str, str]:
+        invalid = [item for item in await server.read_resource("evidencespine://view/bogus")]
+        alias = [item for item in await server.read_resource("evidencespine://view/open-gates")]
+        return invalid[0].content, alias[0].content
+
+    invalid_text, alias_text = asyncio.run(go())
+    assert "Unknown control view" in invalid_text
+    assert "active_scopes" in invalid_text
+    # Hyphen aliases map to the documented underscored view instead of
+    # silently rendering unfiltered active_scopes rows.
+    assert alias_text.startswith("# Control view: open_gates")
+
+
+def test_query_view_tool_rejects_unknown_view(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+
+    async def go() -> Any:
+        return await server.call_tool("query_view", {"view": "open-gates-bogus"})
+
+    result = asyncio.run(go())
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "invalid"
+    assert payload["reason"] == "unknown_view"
+    assert "active_scopes" in payload["valid_views"]
+    assert "rows" not in payload
+
+
+# --- streamable-http bind safety -------------------------------------------------
+
+
+def _patch_streamable_http(monkeypatch) -> dict:
+    import uvicorn
+
+    import evidencespine.mcp_server.server as server_mod
+
+    captured: dict = {"servers": []}
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.raw_app = object()
+
+        def streamable_http_app(self, **kwargs):
+            captured["stream_kwargs"] = kwargs
+            return self.raw_app
+
+    def fake_create_server(**kwargs):
+        server = FakeServer()
+        captured["servers"].append(server)
+        return server
+
+    def fake_run(app, **kwargs):
+        captured["app"] = app
+        captured["run"] = kwargs
+
+    monkeypatch.setattr(server_mod, "create_server", fake_create_server)
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    return captured
+
+
+def _clear_mcp_auth_env(monkeypatch) -> None:
+    monkeypatch.delenv("EVIDENCESPINE_MCP_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED", raising=False)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.5", "example.com"])
+def test_run_server_refuses_unauthenticated_non_loopback(monkeypatch, host: str) -> None:
+    from evidencespine.mcp_server.server import run_server
+
+    _clear_mcp_auth_env(monkeypatch)
+    with pytest.raises(ValueError, match="refusing unauthenticated non-loopback MCP bind"):
+        run_server(transport="streamable-http", host=host, port=0)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_run_server_allows_loopback_without_token(monkeypatch, capsys, host: str) -> None:
+    from evidencespine.mcp_server.server import run_server
+
+    _clear_mcp_auth_env(monkeypatch)
+    captured = _patch_streamable_http(monkeypatch)
+    run_server(transport="streamable-http", host=host, port=0)
+    assert captured["run"]["host"] == host
+    assert "WITHOUT authentication" in capsys.readouterr().out
+
+
+def test_run_server_requires_token_on_non_loopback(monkeypatch, capsys) -> None:
+    from evidencespine.mcp_server.server import run_server
+
+    _clear_mcp_auth_env(monkeypatch)
+    monkeypatch.setenv("EVIDENCESPINE_MCP_AUTH_TOKEN", "legit-token")
+    captured = _patch_streamable_http(monkeypatch)
+    run_server(transport="streamable-http", host="0.0.0.0", port=0)
+    assert captured["run"]["host"] == "0.0.0.0"
+    assert "requires" in capsys.readouterr().out
+    # The served app is wrapped by the bearer middleware (not the raw app).
+    assert callable(captured["app"])
+    assert captured["app"] is not captured["servers"][-1].raw_app
+
+
+def test_run_server_allow_flag_permits_unauthenticated_non_loopback(monkeypatch, capsys) -> None:
+    from evidencespine.mcp_server.server import run_server
+
+    _clear_mcp_auth_env(monkeypatch)
+    monkeypatch.setenv("EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED", "1")
+    captured = _patch_streamable_http(monkeypatch)
+    run_server(transport="streamable-http", host="0.0.0.0", port=0)
+    assert captured["run"]["host"] == "0.0.0.0"
+    assert "EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED" in capsys.readouterr().out
 
 
 def test_live_stdio_server_snapshot_reports_version(tmp_path: Path) -> None:

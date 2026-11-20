@@ -43,14 +43,25 @@ class AdapterIngestResult:
     ingested: int
     failed: int
     skipped: int
+    deduped: int = 0
+    disabled: int = 0
+    reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "status": self.status,
             "thread_id": self.thread_id,
             "seen": int(self.seen),
             "normalized": int(self.normalized),
+            # "ingested" means newly persisted events; replayed events are
+            # reported separately under "deduped" (see "new_events" alias).
             "ingested": int(self.ingested),
             "failed": int(self.failed),
             "skipped": int(self.skipped),
+            "deduped": int(self.deduped),
+            "disabled": int(self.disabled),
+            "new_events": int(self.ingested),
         }
+        if self.reason:
+            payload["reason"] = self.reason
+        return payload

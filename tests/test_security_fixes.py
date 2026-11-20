@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from evidencespine.backends.sqlite import SqliteStoreBackend
 from evidencespine.grounding import ground_ref
 from evidencespine.mcp_server.server import _static_bearer_middleware
@@ -242,3 +244,48 @@ def test_static_bearer_middleware_requires_token() -> None:
     status, text = anyio.run(go, {"Authorization": "Bearer s3cret"})
     assert status == 200
     assert "ok" in text
+
+
+def test_static_bearer_middleware_is_scheme_tolerant_and_rejects_others() -> None:
+    """The MCP bearer guard compares the credential constant-time and accepts
+    the RFC 7235 case-insensitive Bearer scheme, while rejecting other schemes."""
+    import anyio
+
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def home(_request: Any) -> Any:
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route("/", home)])
+    wrapped = _static_bearer_middleware(app, "s3cret")
+
+    async def go(headers: dict[str, str]) -> int:
+        import httpx
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=wrapped), base_url="http://test") as client:
+            response = await client.get("/", headers=headers)
+            return response.status_code
+
+    assert anyio.run(go, {"Authorization": "bearer s3cret"}) == 200
+    assert anyio.run(go, {"Authorization": "Basic s3cret"}) == 401
+    assert anyio.run(go, {"Authorization": "Bearer "}) == 401
+    assert anyio.run(go, {"Authorization": "Bearer s3cret-extra"}) == 401
+
+
+def test_static_bearer_middleware_rejects_empty_token() -> None:
+    with pytest.raises(ValueError):
+        _static_bearer_middleware(object(), "")
+    with pytest.raises(ValueError):
+        _static_bearer_middleware(object(), "   ")
+
+
+def test_static_bearer_middleware_uses_constant_time_comparison() -> None:
+    """Token checks must use hmac.compare_digest, not ==, to avoid timing leaks."""
+    import inspect
+
+    import evidencespine.mcp_server.server as mcp_server_module
+
+    source = inspect.getsource(mcp_server_module._static_bearer_middleware)
+    assert "hmac.compare_digest" in source

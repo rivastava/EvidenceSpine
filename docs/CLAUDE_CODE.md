@@ -1,243 +1,283 @@
-# Claude Code Integration
+# Claude Code integration
 
-This guide shows how to use EvidenceSpine as a sidecar memory layer for Claude Code workflows.
-
-The point is not to replace Claude. The point is to stop passing large raw chat histories between sessions or roles and instead pass a bounded, evidence-backed brief.
-
-It is still a side-car, not the final runtime authority. If you have live runtime signals, reconcile them into EvidenceSpine rather than pretending the memory layer is the organism itself.
-
-## What to log
-
-Log only high-value events:
-1. locked decisions
-2. verified facts
-3. contradictions
-4. open risks
-5. handoffs between roles such as `implementer` and `auditor`
-
-Do not dump full transcripts into EvidenceSpine.
-
-## Minimal pattern
-
-1. After an important step, ingest an event.
-2. Before the next prompt, build a brief.
-3. When switching roles or sessions, emit a handoff packet.
+EvidenceSpine delivers to **Claude Code 2.1.x** (CLI, IDE extension, and the
+Desktop Code tab) as a **skills-directory plugin** with lifecycle hooks, an MCP
+server, a skill, and a rules file. Delivery is automatic: a bounded context
+brief is injected at session start, working state is retained through
+compaction, and session end is recorded. No voluntary tool call is required for
+recall; the full MCP surface is there for deliberate queries.
 
 ## Install
 
-```bash
-pip install evidencespine
-```
-
-Or from source:
-
-```bash
-pip install -e /path/to/evidencespine
-```
-
-## Harness install (hooks)
-
-```bash
+```sh
 evidencespine harness install --harness claude-code --target-dir . --scope project
-# writes .claude-plugin/plugin.json (pointer) + hooks/hooks.json
-#   (wrapped {"hooks": {...}}: SessionStart/SessionEnd/PreCompact, list-shape
-#   with matcher + timeout), .mcp.json (plugin-root MCP registration, also
-#   Claude Code's project MCP scope) and merges .claude/settings.json
-#   (non-destructive).
-# Global: --target-dir <plugin-home> --scope global (settings merge goes to
-# ~/.claude/settings.json).
+
+# settings-only setups (double-run caveat below)
+evidencespine harness install --harness claude-code --with-settings-hooks
+
+# global plugin under the user's skills directory
+evidencespine harness install --harness claude-code --scope global --target-dir ~
+
+# preview
+evidencespine harness install --harness claude-code --target-dir . --dry-run
 ```
 
-Event contracts (`code.claude.com/docs/en/hooks`): `SessionStart` plaintext →
-context; `SessionEnd` is session terminate (distinct from per-turn `Stop`);
-`PreCompact` must return the
-`{"hookSpecificOutput": {"hookEventName": "PreCompact", "additionalContext": ...}}`
-envelope (handled by `harness claude-code precompact`). Validate with
-`claude plugin validate`. Hooks fire in CLI, IDE extension, and Desktop Code
-tab identically; legacy desktop-only MCP uses `claude_desktop_config.json`.
-
-## Basic runtime
-
-```python
-from evidencespine.runtime import AgentMemoryRuntime
-from evidencespine.settings import EvidenceSpineSettings
-
-settings = EvidenceSpineSettings.from_env(base_dir=".evidencespine")
-runtime = AgentMemoryRuntime(config=settings.to_runtime_config())
-```
-
-## Ingest a Claude Code event
-
-```python
-runtime.ingest_event(
-    {
-        "thread_id": "bugfix_auth_timeout",
-        "event_type": "decision",
-        "role": "implementer",
-        "source_agent_id": "claude_code",
-        "source_turn_id": "turn_17",
-        "payload": {
-            "claim": "Use additive patch only. Do not touch auth token rotation.",
-            "decision": "Patch retry path in request middleware",
-            "fact_state": "verified",
-            "next_actions": ["auditor should verify timeout edge cases"],
-        },
-        "evidence_refs": ["src/middleware/request_timeout.py:42"],
-        "state_context": {
-            "scope_id": "auth-timeout-fix",
-            "state_kind": "agent_local_work",
-            "status": "active",
-            "owner_agent_id": "implementer",
-        },
-        "confidence": 0.87,
-        "salience": 0.74,
-    }
-)
-```
-
-## Build a bounded brief before the next prompt
-
-```python
-brief = runtime.build_brief(
-    "bugfix_auth_timeout",
-    "current goal, locked decisions, verified facts, active risks"
-)
-
-print(brief.to_dict())
-print(runtime.query_view("active_scopes", thread_id="bugfix_auth_timeout").to_dict())
-```
-
-Use that brief in the next Claude Code prompt instead of pasting a long raw thread.
-
-If you want markdown-style output, render the dictionary into your preferred prompt format before sending it to Claude.
-
-## Optional transcript import path
-
-If you already have a raw transcript-like `messages[]` payload and want to import it into EvidenceSpine before building the brief, use `TranscriptAdapter`:
-
-```python
-from evidencespine.adapters import TranscriptAdapter
-
-adapter = TranscriptAdapter(runtime, default_thread_id="bugfix_auth_timeout")
-adapter.ingest_messages(
-    [
-        {"role": "user", "content": "Audit the timeout regression"},
-        {"role": "assistant", "content": "Patched retry middleware only"},
-        {"role": "tool", "content": "pytest passed"},
-    ]
-)
-```
-
-This is the recommended default when integrating from transcript-oriented tools because it keeps the transform explicit and replayable.
-Caller-provided `state_context` survives transcript normalization if you want to mark ownership, blockers, or pending gates from the calling workflow.
-
-## Emit a handoff packet
-
-```python
-packet = runtime.emit_handoff(
-    role="auditor",
-    thread_id="bugfix_auth_timeout",
-    scope="verify patch and regression risk"
-)
-
-print(packet.to_dict())
-```
-
-## Suggested Claude Code workflow
-
-### Implementer loop
-
-After a significant patch or decision:
-
-```python
-runtime.ingest_event(...)
-```
-
-Before asking Claude Code for the next step:
-
-```python
-brief = runtime.build_brief(thread_id, "what matters now")
-```
-
-Prompt shape:
+Project-scope output (all merge-preserving, idempotent):
 
 ```text
-Use this EvidenceSpine brief as the working state.
-
-<brief markdown here>
-
-Task:
-- implement the next safe step
-- preserve locked decisions
-- call out contradictions if any
+<repo>/.claude/skills/evidencespine/
+    .claude-plugin/plugin.json      manifest (only file inside .claude-plugin/)
+    hooks/hooks.json                wrapped {"description", "hooks": {...}}
+    .mcp.json                       plugin MCP registration (stdio)
+    skills/evidencespine/SKILL.md   auto-surfacing skill
+    README.md                       directory-profile documentation
+<repo>/.claude/rules/evidencespine.md   standing policy (loads every session)
 ```
 
-### Auditor loop
+The installer runs `claude plugin validate --strict <plugin_dir>` when the
+`claude` CLI is on PATH and reports `validation.status`
+(`passed` / `failed` / `skipped`) plus a `next_step` line in its JSON
+result.
 
-When switching from implementer to auditor:
+## Why a skills-directory plugin
 
-```python
-packet = runtime.emit_handoff("auditor", thread_id, scope="verify latest claims")
+Claude Code does **not** scan a project's `.claude-plugin/` or
+`.claude/plugins/` directories for plugins. The only project-local plugin
+form that auto-loads with no install flag and no marketplace is a
+**skills-directory plugin**:
+
+```text
+<project>/.claude/skills/<name>/...
 ```
 
-Then give the auditor agent:
-1. the handoff packet
-2. the file diff or repo state
-3. the narrow validation task
+It loads as `evidencespine@skills-dir`. Consequences:
 
-## Recommended conventions
+- The first interactive session shows a **workspace-trust** dialog; the plugin
+  is scanned after trust is accepted. `-p` / SDK / cloud sessions treat the
+  folder as trusted and load without asking.
+- **Launch from the repository root.** Parent directories are not searched for
+  plugins, and a plugin placed anywhere else in the tree (including a
+  repo-root `.claude-plugin/plugin.json`) is inert unless loaded with
+  `--plugin-dir`, a marketplace install, or
+  `CLAUDE_CODE_PLUGIN_DIRS`.
+- Admins can block skills-dir plugins; use
+  `claude --plugin-dir <dir> plugin list` to confirm a recognized layout.
+- `/reload-plugins` rescans after edits.
 
-Use stable role names:
-1. `implementer`
-2. `auditor`
-3. `researcher`
-4. `operator`
+## Hook wiring
 
-Use stable fact states:
-1. `asserted`
-2. `verified`
-3. `contradicted`
-4. `superseded`
+`hooks/hooks.json` must be wrapped under a top-level `hooks` key (the bare
+event map fails `claude plugin validate` with
+`hooks.json must have "hooks"`). The installer writes:
 
-Use `state_context` for operational semantics:
-1. `agent_local_work`
-2. `global_blocker`
-3. `pending_gate`
-4. `runtime_validated_state`
+```json
+{
+  "description": "EvidenceSpine delivery: auto-recall at session start, retain through pre-compaction, fast auto-retain at session end.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<absolute-path-to-evidencespine>",
+            "args": ["harness", "claude-code", "session-start", "--base-dir", "${CLAUDE_PROJECT_DIR:-.}/.evidencespine"],
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<absolute-path-to-evidencespine>",
+            "args": ["harness", "claude-code", "session-stop", "--base-dir", "${CLAUDE_PROJECT_DIR:-.}/.evidencespine"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<absolute-path-to-evidencespine>",
+            "args": ["harness", "claude-code", "precompact", "--base-dir", "${CLAUDE_PROJECT_DIR:-.}/.evidencespine"],
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
-Use real evidence refs whenever possible:
-1. file paths with lines
-2. test names
-3. report paths
-4. benchmark artifact paths
+Rules that matter:
 
-## Good use cases for Claude Code
+- **Exec form** (`command` + `args`) avoids shell quoting entirely and is
+  the documented form when a path placeholder is used. Shell-form
+  (`command` only) runs through `sh` / Git Bash / PowerShell and is a
+  portability trap, especially on Windows.
+- `${CLAUDE_PROJECT_DIR}` is set for hook commands and stdio MCP servers;
+  project `.mcp.json` must write `${CLAUDE_PROJECT_DIR:-.}` because an
+  unset variable without a default is used literally. Plugin-provided MCP
+  substitutes `${CLAUDE_PROJECT_DIR}` directly.
+- `timeout` is a handler field, in seconds.
+- Hooks **fail open**: a missing store or a broken binary returns a one-line
+  notice instead of failing the session. Injected text is capped at 10,000
+  characters (`CONTEXT_CHAR_LIMIT`); the brief budget (1800 tokens by
+  default) stays well under it.
 
-1. long bugfix threads
-2. implementer to reviewer handoffs
-3. parallel agent workflows
-4. architecture changes with many locked constraints
-5. overnight or resumed sessions where context drift usually happens
+### Plugin hooks vs settings hooks (do not run both)
 
-## Anti-patterns
+Claude Code merges hook sources and **does not de-duplicate** a plugin handler
+against an identical settings handler: if the same handler exists in both
+places, it runs twice. The project install therefore writes plugin hooks only.
+`--with-settings-hooks` appends the same groups to `.claude/settings.json`
+as an explicit opt-in for settings-only setups; do not combine it with a plugin
+that also loads.
 
-Do not use EvidenceSpine as:
-1. a raw transcript archive
-2. a replacement for source control
-3. a place for unverified claims without evidence refs
+**Old-install cleanup:** earlier EvidenceSpine versions wrote a repo-root
+plugin (`<repo>/.claude-plugin/plugin.json` plus `<repo>/hooks/hooks.json`)
+and merged hooks into `.claude/settings.json`. That layout never auto-loaded,
+but it now duplicates delivery if you also run `--plugin-dir`. After
+upgrading, delete the stale repo-root `.claude-plugin/` and `hooks/`
+folders and remove the EvidenceSpine hook groups from
+`.claude/settings.json` (keep user hooks; back the file up first). Keep
+`.claude/rules/evidencespine.md`; it is the intended policy surface.
 
-## Example file
+## Output channels (event semantics)
 
-See:
-- `examples/claude_code_usage.py`
-- `examples/transcript_replay_harness.py`
-- `docs/ADAPTERS.md`
+| Event | Channel | What EvidenceSpine does |
+|---|---|---|
+| `SessionStart` | plain-text stdout is added to Claude's context | prints the bounded brief (plus a one-line operating preamble) for the workspace thread |
+| `SessionEnd` | side effects only; no decision control | records one fast reflection event; the stdin `reason` (clear/resume/logout/prompt_input_exit/other) is stored as metadata, never as summary text |
+| `PreCompact` | **plain-text stdout is the documented channel**: with exit 0 and no block, Claude uses it as instructions for the compaction summary | persists the custom instructions/summary, then prints the working-state note. `hookSpecificOutput.additionalContext` is **not** a supported PreCompact output and is not emitted (the old envelope was wrong) |
+| `PostCompact` (not installed) | stdout discarded | the next `SessionStart` with source `compact` re-anchors recall |
 
-## Operational checklist
+`SessionEnd` has a **~1.5 s default terminate budget**. A plugin hook's
+`timeout` does not raise that budget (only settings-file timeouts or
+`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` do), which is why the handler does
+one fast ingest and nothing slow. Set
+`CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` if you add heavy user hooks.
 
-1. Ingest only high-signal events.
-2. Mark `fact_state` correctly.
-3. Build the brief before major prompt transitions.
-4. Check `query_view("active_scopes")` or `query_view("open_gates")` before role switches.
-5. Emit handoff packets when switching roles.
-6. Watch `snapshot()` for citation, freshness, and conflict metrics.
+The provider control fields (`trigger`, `reason`, `source`) are never
+stored as the session outcome; only genuine summary content
+(`compact_summary`, `custom_instructions`, `conversation_summary`,
+`summary`, `note`) is.
+
+## Thread identity
+
+Claude Code sends a fresh `session_id` per session. Using it as the thread id
+would create one empty thread per session, so the CLI resolves a
+**workspace-scoped** thread:
+
+`text
+explicit --thread-id > EVIDENCESPINE_THREAD_ID > proj_<sha1(realpath(git toplevel))[:12]>
+`
+
+Session and turn identity travel in `source_turn_id` / `metadata.session_id`.
+If you want a deliberate isolation per conversation, set
+`EVIDENCESPINE_THREAD_ID` in the environment Claude Code launches with.
+
+## MCP registration
+
+The plugin ships its own `.mcp.json` (stdio, command + args) and registers as
+`plugin:evidencespine:evidencespine`; tools are named
+`mcp__plugin_evidencespine_evidencespine__<tool>`. A project-scope
+`.mcp.json` is also supported by Claude Code directly (one approval prompt):
+
+```json
+{
+  "mcpServers": {
+    "evidencespine": {
+      "command": "evidencespine",
+      "args": ["mcp", "--base-dir", "${CLAUDE_PROJECT_DIR:-.}/.evidencespine"]
+    }
+  }
+}
+```
+
+CLI equivalents:
+
+```sh
+claude mcp add --scope user    --transport stdio evidencespine -- evidencespine mcp --base-dir "$PWD/.evidencespine"
+claude mcp add --scope project --transport stdio evidencespine -- evidencespine mcp --base-dir .evidencespine
+claude mcp list
+```
+
+HTTP transport uses `type: "http"` (`streamable-http` is an accepted
+alias) with `url` and `headers`:
+
+```json
+{
+  "mcpServers": {
+    "evidencespine": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer ${EVIDENCESPINE_MCP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+## Instructions: rules, skill, AGENTS.md
+
+- `.claude/rules/evidencespine.md` loads every session alongside CLAUDE.md
+  (same priority as `.claude/CLAUDE.md`) and carries the standing policy:
+  consult the spine before asserting state, ground before claiming verified,
+  drift-check after edits, import/emit handoffs. It does not touch the user's
+  CLAUDE.md or its recommended 200-line budget.
+- The plugin skill `skills/evidencespine/SKILL.md` auto-surfaces when the
+  agent is about to assert state, mark something verified, or hand off. It is
+  invoked as `/evidencespine:evidencespine` and by description matching.
+- `AGENTS.md` is only read by Claude Code when there is **no**
+  CLAUDE.md/`.claude/CLAUDE.md`/`CLAUDE.local.md` in the working directory
+  or above. The committed AGENTS.md guide is therefore a secondary channel
+  here; `--with-agents-md` exists for repos that have no CLAUDE.md, the other
+  harnesses, and Codex/DSH. A `CLAUDE.md` at a plugin root is **never**
+  loaded (write instructions as a skill instead).
+
+## Validate and verify
+
+```sh
+# installer already runs this; run it yourself after edits
+claude plugin validate --strict .claude/skills/evidencespine
+echo $?          # 0 = passed, 1 = failed, 2 = validator crash
+
+claude plugin list
+claude --plugin-dir .claude/skills/evidencespine plugin details evidencespine
+# expect: Hooks (3) SessionStart, SessionEnd, PreCompact; MCP servers (1); Skills (1)
+
+claude mcp list
+claude --debug-file /tmp/claude-debug.log      # hook execution log
+```
+
+Directory submissions additionally need a README (the generated plugin ships
+one); the `--profile directory` validator mode can still report
+`ICON_MISSING` as a non-blocking warning.
+
+## Limits and troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `claude plugin list` shows nothing | Not launched from the repo root, workspace trust not accepted, or an admin blocked skills-dir plugins. Launch from the root and accept the dialog; use `--plugin-dir` to test. |
+| Hooks appear to do nothing | Check workspace trust and `claude --debug-file`. Hooks fail open, so a broken side-car is silent except for the fail-open notice line. |
+| Brief injected twice | Plugin hooks and settings hooks both active (often from an old install). Remove the settings copy or the plugin; keep one. |
+| Session end is slow or cuts off | `SessionEnd` has a ~1.5 s budget; keep handlers fast, or raise `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`. |
+| PreCompact state missing | Confirm the hook fired (`/hooks` or debug log) and that PreCompact is installed (`--with-precompact` is off only if you customized the installer). |
+| Different store than expected | A relative `--base-dir` resolves against `${CLAUDE_PROJECT_DIR}` in hooks but per-CWD in a project `.mcp.json` without a default; use the emitted placeholder. |
+| MCP tools missing | Approve the project `.mcp.json` prompt, and restart after upgrading: a long-lived MCP server keeps serving its start-time code. Compare `snapshot.evidencespine_version` with `evidencespine harness debug` and restart on mismatch. |
+
+## Reference
+
+- Docs: [HARNESS_MATRIX.md](HARNESS_MATRIX.md), [INTEGRATION.md](INTEGRATION.md),
+  [PROTOCOL.md](PROTOCOL.md), [SECURITY.md](SECURITY.md)
+- Example: `examples/claude_code_usage.py`
+- Canonical agent playbook: the repository `AGENTS.md` /
+  `evidencespine://guide` resource.

@@ -19,6 +19,11 @@ STATE_BASES = ("reported", "runtime_validated", "derived", "imported")
 FRESHNESS_STATES = ("fresh", "stale", "unknown")
 LEASE_STATES = ("active", "expired", "none")
 
+# Citation claim lines are capped at this many characters everywhere a brief
+# claim is rendered, persisted, or measured, so in-process citation coverage
+# and on-disk citation coverage agree for long claims.
+CITATION_LINE_MAX = 1024
+
 _STATE_SCOPE_KIND_DEFAULTS = {
     "agent_local_work": "task",
     "global_blocker": "blocker",
@@ -708,6 +713,32 @@ def _validate_claim_citation_value(value: Any) -> List[str]:
     return errors
 
 
+def _event_hash_for_parts(
+    *,
+    thread_id: Any,
+    event_type: Any,
+    source_agent_id: Any,
+    source_turn_id: Any,
+    payload: Any,
+    evidence_refs: Any,
+    evidence_items: Any,
+    state_context: Any,
+) -> str:
+    """Canonical event hash over the same normalized fields used on disk."""
+    return _canonical_hash(
+        {
+            "thread_id": thread_id,
+            "event_type": event_type,
+            "source_agent_id": source_agent_id,
+            "source_turn_id": source_turn_id,
+            "payload": payload,
+            "evidence_refs": evidence_refs,
+            "evidence_items": evidence_items,
+            "state_context": state_context,
+        }
+    )
+
+
 @dataclass
 class AgentMemoryEvent:
     event_id: str
@@ -755,20 +786,52 @@ class AgentMemoryEvent:
             payload["state_context"] = state_context
         if payload["role"] not in AGENT_ROLES:
             payload["role"] = "unknown"
-        hash_payload = {
-            "thread_id": payload["thread_id"],
-            "event_type": payload["event_type"],
-            "source_agent_id": payload["source_agent_id"],
-            "source_turn_id": payload["source_turn_id"],
-            "payload": payload["payload"],
-            "evidence_refs": payload["evidence_refs"],
-            "evidence_items": payload["evidence_items"],
-            "state_context": payload.get("state_context", {}),
-        }
-        payload["event_hash"] = _canonical_hash(hash_payload)
+        payload["event_hash"] = _event_hash_for_parts(
+            thread_id=payload["thread_id"],
+            event_type=payload["event_type"],
+            source_agent_id=payload["source_agent_id"],
+            source_turn_id=payload["source_turn_id"],
+            payload=payload["payload"],
+            evidence_refs=payload["evidence_refs"],
+            evidence_items=payload["evidence_items"],
+            state_context=payload.get("state_context", {}),
+        )
         if not payload["event_id"]:
             payload["event_id"] = f"ame_{payload['event_hash'][:16]}"
         return payload
+
+
+def refresh_event_identity(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Recompute event_hash for a (possibly rewritten) event row.
+
+    Used after pre-storage redaction: the hash binds the stored payload, so it
+    must be recomputed from the redacted row. The auto ame_ ids are refreshed
+    too; caller-supplied ids are preserved (stable identity).
+    """
+    payload = dict(row or {})
+    event_type = safe_text(payload.get("event_type"), "reflection", 64).lower()
+    if event_type not in EVENT_LIFECYCLE:
+        event_type = "reflection"
+    raw_payload = payload.get("payload", {})
+    event_payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    evidence_items = normalize_evidence_items(payload.get("evidence_items"))
+    evidence_refs = merge_evidence_refs(payload.get("evidence_refs"), evidence_items)
+    state_context = normalize_state_context(payload.get("state_context")) if payload.get("state_context") is not None else {}
+    event_hash = _event_hash_for_parts(
+        thread_id=safe_text(payload.get("thread_id"), "", 128),
+        event_type=event_type,
+        source_agent_id=safe_text(payload.get("source_agent_id"), "unknown", 128),
+        source_turn_id=safe_text(payload.get("source_turn_id"), "", 128),
+        payload=event_payload,
+        evidence_refs=evidence_refs,
+        evidence_items=evidence_items,
+        state_context=state_context,
+    )
+    payload["event_hash"] = event_hash
+    current_id = safe_text(payload.get("event_id"), "", 128)
+    if not current_id or current_id.startswith("ame_"):
+        payload["event_id"] = f"ame_{event_hash[:16]}"
+    return payload
 
 
 @dataclass
@@ -815,9 +878,11 @@ class AgentMemoryFact:
         if state_context:
             payload["state_context"] = state_context
         if not payload["fact_id"]:
+            # Fact identity is case-insensitive (and whitespace-insensitive) so
+            # "Fix X" / "fix x" are the same claim; the original text is stored.
             hash_payload = {
                 "thread_id": payload["thread_id"],
-                "claim": payload["claim"],
+                "claim": safe_text(payload.get("claim"), "", 4096).strip().lower(),
                 "source_turn_id": payload["source_turn_id"],
             }
             payload["fact_id"] = f"amf_{_canonical_hash(hash_payload)[:16]}"
@@ -843,7 +908,7 @@ class AgentConversationBrief:
         structured_citations: Dict[str, Dict[str, Any]] = {}
         citation_refs: Dict[str, List[str]] = {}
         for key, value in dict(self.citations or {}).items():
-            claim = safe_text(key, "", 1024)
+            claim = safe_text(key, "", CITATION_LINE_MAX)
             if not claim:
                 continue
             citation = ClaimCitation.from_value(value)
@@ -855,12 +920,12 @@ class AgentConversationBrief:
             "query": safe_text(self.query, "", 1024),
             "generated_at": safe_text(self.generated_at, utc_now_iso(), 64),
             "token_budget": int(max(64, int(self.token_budget or 1800))),
-            "current_goal": [safe_text(x, "", 1024) for x in list(self.current_goal or []) if safe_text(x, "", 1024)],
-            "locked_decisions": [safe_text(x, "", 1024) for x in list(self.locked_decisions or []) if safe_text(x, "", 1024)],
-            "recent_verified_facts": [safe_text(x, "", 1024) for x in list(self.recent_verified_facts or []) if safe_text(x, "", 1024)],
-            "active_risks": [safe_text(x, "", 1024) for x in list(self.active_risks or []) if safe_text(x, "", 1024)],
-            "open_items": [safe_text(x, "", 1024) for x in list(self.open_items or []) if safe_text(x, "", 1024)],
-            "next_actions": [safe_text(x, "", 1024) for x in list(self.next_actions or []) if safe_text(x, "", 1024)],
+            "current_goal": [safe_text(x, "", CITATION_LINE_MAX) for x in list(self.current_goal or []) if safe_text(x, "", CITATION_LINE_MAX)],
+            "locked_decisions": [safe_text(x, "", CITATION_LINE_MAX) for x in list(self.locked_decisions or []) if safe_text(x, "", CITATION_LINE_MAX)],
+            "recent_verified_facts": [safe_text(x, "", CITATION_LINE_MAX) for x in list(self.recent_verified_facts or []) if safe_text(x, "", CITATION_LINE_MAX)],
+            "active_risks": [safe_text(x, "", CITATION_LINE_MAX) for x in list(self.active_risks or []) if safe_text(x, "", CITATION_LINE_MAX)],
+            "open_items": [safe_text(x, "", CITATION_LINE_MAX) for x in list(self.open_items or []) if safe_text(x, "", CITATION_LINE_MAX)],
+            "next_actions": [safe_text(x, "", CITATION_LINE_MAX) for x in list(self.next_actions or []) if safe_text(x, "", CITATION_LINE_MAX)],
             "citations": structured_citations,
             "citation_refs": citation_refs,
             "metadata": dict(self.metadata or {}),
@@ -888,6 +953,15 @@ def _normalize_handoff_row(row: Dict[str, Any], *, require_claim: bool) -> Dict[
     status = safe_text(payload.get("status"), "", 32).lower()
     if status:
         payload["status"] = status
+
+    # Additive provenance keys: verification provenance and the stale-evidence
+    # flag travel with claim/unresolved rows so a handoff round-trip preserves
+    # why a claim was verified and whether its evidence drifted.
+    verification = normalize_verification(payload.get("verification"))
+    payload["verification"] = dict(verification) if verification else None
+    payload["evidence_stale"] = bool(payload.get("evidence_stale"))
+    metadata = payload.get("metadata")
+    payload["metadata"] = dict(metadata) if isinstance(metadata, dict) else {}
 
     if "state_context" in payload:
         payload["state_context"] = normalize_state_context(payload.get("state_context"))
@@ -1001,6 +1075,18 @@ def validate_brief_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
+def _validate_handoff_provenance_fields(payload: Dict[str, Any], prefix: str) -> List[str]:
+    errors: List[str] = []
+    if "verification" in payload and payload.get("verification") is not None:
+        raw = payload.get("verification")
+        verified = normalize_verification(raw)
+        if not isinstance(raw, dict) or not verified.get("method") or not verified.get("reference"):
+            errors.append(f"invalid:{prefix}:verification")
+    if "metadata" in payload and payload.get("metadata") is not None and not isinstance(payload.get("metadata"), dict):
+        errors.append(f"invalid:{prefix}:metadata")
+    return errors
+
+
 def validate_handoff_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if not isinstance(payload, dict):
         return False, ["not_a_dict"]
@@ -1018,6 +1104,7 @@ def validate_handoff_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 errors.append(f"invalid:claims[{idx}]:claim")
             errors.extend(_validate_evidence_items_field(row, "evidence_items"))
             errors.extend(_validate_state_context_field(row, "state_context"))
+            errors.extend(_validate_handoff_provenance_fields(row, f"claims[{idx}]"))
     unresolved = payload.get("unresolved_contradictions", [])
     if unresolved and not isinstance(unresolved, list):
         errors.append("invalid:unresolved_contradictions")
@@ -1028,6 +1115,7 @@ def validate_handoff_dict(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 continue
             errors.extend(_validate_evidence_items_field(row, "evidence_items"))
             errors.extend(_validate_state_context_field(row, "state_context"))
+            errors.extend(_validate_handoff_provenance_fields(row, f"unresolved_contradictions[{idx}]"))
     errors.extend(_validate_evidence_items_field(payload, "evidence_items"))
     return len(errors) == 0, errors
 
@@ -1059,6 +1147,12 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     supersedes = safe_text(
         payload.get("supersedes_ref") or event.get("supersedes_fact_id"), "", 128
     )
+    if not supersedes and state_context is not None:
+        # state_context.supersedes is the structured control-state form of an
+        # explicit supersession; promote it onto the derived fact.
+        supersedes = safe_text(state_context.get("supersedes"), "", 128)
+    event_metadata = event.get("metadata", {}) if isinstance(event.get("metadata", {}), dict) else {}
+    evidence_stale = bool(payload.get("evidence_stale")) or bool(event_metadata.get("evidence_stale"))
     verification = normalize_verification(payload.get("verification") or event.get("verification"))
 
     dedup: Dict[str, Dict[str, Any]] = {}
@@ -1066,13 +1160,16 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
         clean_claim = safe_text(claim, "", 2048)
         if not clean_claim:
             continue
-        key = _canonical_hash({"thread_id": thread_id, "claim": clean_claim})
+        key = _canonical_hash({"thread_id": thread_id, "claim": clean_claim.strip().lower()})
         row: Dict[str, Any] = {
             "thread_id": thread_id,
             "claim": clean_claim,
             "state": state,
             "source_agent_id": source_agent_id,
             "source_turn_id": source_turn_id,
+            # Derived facts inherit the source event time so control-view
+            # recency and brief lookback see when the claim happened.
+            "ts_utc": safe_text(event.get("ts_utc"), utc_now_iso(), 64),
             "evidence_refs": list(evidence_refs),
             "evidence_items": list(evidence_items),
             "confidence": safe_float(payload.get("confidence", event.get("confidence", 0.5)), 0.5, 0.0, 1.0),
@@ -1082,8 +1179,13 @@ def event_to_fact_candidates(event: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "event_id": safe_text(event.get("event_id"), "", 128),
                 "event_type": safe_text(event.get("event_type"), "reflection", 64).lower(),
                 **({"verification": dict(verification)} if verification else {}),
+                **({"evidence_stale": True} if evidence_stale else {}),
             },
         }
+        if evidence_stale and safe_text(row.get("state"), "asserted", 32).lower() == "verified":
+            # Stale evidence must never mint a verified fact.
+            row["state"] = "asserted"
+            row["metadata"]["policy"] = "stale_evidence"
         if state_context is not None:
             row["state_context"] = dict(state_context)
         dedup[key] = row

@@ -1,3 +1,13 @@
+"""Replay a LangGraph-style message trace through the LangGraph adapter.
+
+Run from the repo root:
+
+    PYTHONPATH=src python examples/langgraph_replay_demo.py
+
+Uses the bundled replay fixture and a temporary store; prints ingest, brief,
+and handoff results.
+"""
+
 from __future__ import annotations
 
 import json

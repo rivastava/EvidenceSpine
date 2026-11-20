@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from evidencespine.mcp_server.tools import VALID_CONTROL_VIEWS, normalize_control_view
 from evidencespine.render import (
     render_brief_markdown,
     render_snapshot_markdown,
@@ -48,12 +49,20 @@ def register_resources(server: Any, get_runtime: Callable[[], Any]) -> None:
         "evidencespine://view/{view}",
         name="control view",
         title="Derived control view",
-        description="Markdown rows for a control view: active_scopes, my_work, open_gates, stale_claims, contradictions.",
+        description="Markdown rows for a control view: active_scopes, my_work, open_gates, stale_claims, contradictions (hyphen aliases accepted; unknown views return an error).",
         mime_type="text/markdown",
     )
     def control_view(view: str) -> str:
         """Render a derived control view as markdown."""
-        payload = get_runtime().query_view(view, limit=50).to_dict()
+        view_name = normalize_control_view(view)
+        if view_name is None:
+            valid = ", ".join(VALID_CONTROL_VIEWS)
+            return (
+                f"# Control view: {view}\n\n"
+                f"Unknown control view. Valid views: {valid} "
+                "(hyphen aliases accepted)."
+            )
+        payload = get_runtime().query_view(view_name, limit=50).to_dict()
         return render_view_markdown(payload)
 
     @server.resource(

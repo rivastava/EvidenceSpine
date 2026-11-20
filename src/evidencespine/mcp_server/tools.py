@@ -8,10 +8,104 @@ guarded by a re-entrant lock per backend.
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Any, Callable, Dict, Optional
 
 from evidencespine.grounding import ground_claim_refs
+
+_HANDOFF_PATH_REJECTED: Dict[str, str] = {
+    "status": "invalid",
+    "reason": "path_outside_source_root",
+}
+
+#: Documented control views. Hyphenated aliases (e.g. open-gates) are accepted.
+VALID_CONTROL_VIEWS: tuple[str, ...] = (
+    "active_scopes",
+    "my_work",
+    "open_gates",
+    "stale_claims",
+    "contradictions",
+)
+
+
+def normalize_control_view(view: Any) -> Optional[str]:
+    """Normalize a caller-supplied control view name.
+
+    Case-insensitive; hyphenated aliases (open-gates) map to the documented
+    underscored names. Returns None for unknown views so callers can fail with
+    a clear invalid-view error instead of silently receiving unfiltered
+    active_scopes rows.
+    """
+    text = str(view or "").strip().lower().replace("-", "_")
+    return text if text in VALID_CONTROL_VIEWS else None
+
+
+def _resolve_thread(thread_id: Any) -> str:
+    """Resolve an omitted/empty thread id to the workspace-scoped thread."""
+    from evidencespine.threads import resolve_thread_id
+
+    return resolve_thread_id(str(thread_id or ""))
+
+_DRIFT_CONFINEMENT_MISSING = "runtime_missing_evidence_confinement"
+
+
+def _supports_confined_drift(runtime: Any) -> bool:
+    """True when the runtime implements the server-side drift confinement mode."""
+    try:
+        params = inspect.signature(runtime.check_evidence_stale).parameters
+    except (TypeError, ValueError):
+        return False
+    return "allow_absolute_source_id" in params
+
+
+def _check_drift_confined(
+    runtime: Any,
+    *,
+    thread_id: str,
+    source_root: str,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Run the drift checker confined to the server grounding root.
+
+    A network caller must never decide which host directory is read: the
+    caller-supplied source root is ignored and absolute/escaping source ids
+    are reported as unverifiable. Older runtimes without the confinement mode
+    are refused rather than silently allowed to keep the content oracle.
+    """
+    if not _supports_confined_drift(runtime):
+        return {
+            "status": "unsupported",
+            "reason": _DRIFT_CONFINEMENT_MISSING,
+            "checked_items": 0,
+            "stale_facts": 0,
+            "cleared_facts": 0,
+            "unverifiable_items": 0,
+            "dry_run": bool(dry_run),
+            "results": [],
+        }
+    return runtime.check_evidence_stale(
+        thread_id=thread_id,
+        source_root=source_root,
+        dry_run=bool(dry_run),
+        allow_absolute_source_id=False,
+    )
+
+
+def _confine_handoff_path(raw_path: str, grounding_root: str) -> Optional[str]:
+    """Resolve a caller-supplied packet path inside the grounding root.
+
+    Absolute paths and paths escaping the root (including via symlinks) return
+    None so the caller cannot make the server open arbitrary host files.
+    """
+    text = str(raw_path or "").strip()
+    if not text or os.path.isabs(text):
+        return None
+    root_real = os.path.realpath(grounding_root)
+    candidate = os.path.realpath(os.path.join(root_real, text))
+    if candidate == root_real or not candidate.startswith(root_real + os.sep):
+        return None
+    return candidate
 
 
 def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: str = "") -> None:
@@ -52,6 +146,8 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
             grounded = ground_claim_refs(ground_refs, source_root=grounding_root, allow_absolute=False)
             existing = [dict(x) for x in list(event.get("evidence_items") or [])]
             event["evidence_items"] = [*existing, *grounded]
+        if not str(event.get("thread_id") or "").strip():
+            event["thread_id"] = _resolve_thread("")
         return get_runtime().ingest_event(event)
 
     @server.tool(
@@ -64,18 +160,20 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
             "query to shape focus and token_budget to bound output size."
         ),
     )
-    def build_brief(thread_id: str, query: str = "", token_budget: Optional[int] = None) -> Dict[str, Any]:
+    def build_brief(thread_id: str = "", query: str = "", token_budget: Optional[int] = None) -> Dict[str, Any]:
         """Build a bounded context brief for a thread."""
         budget = int(token_budget) if token_budget is not None and int(token_budget) > 0 else None
-        return get_runtime().build_brief(thread_id=thread_id, query=query, token_budget=budget).to_dict()
+        return get_runtime().build_brief(thread_id=_resolve_thread(thread_id), query=query, token_budget=budget).to_dict()
 
     @server.tool(
         name="query_view",
         title="Query a derived control view",
         description=(
-            "Query a derived agent-state control view. Views: active_scopes, my_work, "
-            "open_gates, stale_claims, contradictions. Rows resolve competing state "
-            "records per scope (supersedes/freshness/conflict aware)."
+            "Query a derived agent-state control view. Views (hyphen aliases "
+            "accepted): active_scopes, my_work, open_gates, stale_claims, "
+            "contradictions. Rows resolve competing state records per scope "
+            "(supersedes/freshness/conflict aware). Unknown views return status "
+            "invalid with reason unknown_view instead of unfiltered rows."
         ),
     )
     def query_view(
@@ -86,9 +184,17 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
         limit: int = 50,
     ) -> Dict[str, Any]:
         """Query a derived agent-state control view."""
+        view_name = normalize_control_view(view)
+        if view_name is None:
+            return {
+                "status": "invalid",
+                "reason": "unknown_view",
+                "view": str(view or ""),
+                "valid_views": list(VALID_CONTROL_VIEWS),
+            }
         return get_runtime().query_view(
-            view,
-            thread_id=thread_id,
+            view_name,
+            thread_id=_resolve_thread(thread_id),
             owner_agent_id=owner_agent_id,
             include_closed=bool(include_closed),
             limit=int(max(1, int(limit))),
@@ -106,21 +212,24 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
     )
     def emit_handoff(
         role: str = "auditor",
-        thread_id: str = "default",
+        thread_id: str = "",
         scope: str = "cross-agent coordination",
     ) -> Dict[str, Any]:
         """Emit an evidence-bound handoff packet."""
-        return get_runtime().emit_handoff(role=role, thread_id=thread_id, scope=scope).to_dict()
+        return get_runtime().emit_handoff(role=role, thread_id=_resolve_thread(thread_id), scope=scope).to_dict()
 
     @server.tool(
         name="import_handoff",
         title="Import a handoff packet",
         description=(
             "Import a handoff packet produced by another agent/run. Provide either "
-            "packet (the packet JSON object) or path (a file path). Locked decisions, "
-            "claims, contradictions and validations are ingested with their fact_state/"
-            "classification preserved. Pass thread_id to bind imported rows to the "
-            "importer's thread; otherwise they inherit the packet's thread_id."
+            "packet (the packet JSON object) or path (a relative file path resolved "
+            "under the server source root; absolute paths and paths escaping the "
+            "root are rejected with reason path_outside_source_root). Locked "
+            "decisions, claims, contradictions and validations are ingested with "
+            "their fact_state/classification preserved. Pass thread_id to bind "
+            "imported rows to the importer's thread; otherwise they inherit the "
+            "packet's thread_id."
         ),
     )
     def import_handoff(
@@ -129,10 +238,18 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
         source_agent_id: str = "external_agent",
         thread_id: str = "",
     ) -> Dict[str, Any]:
-        """Import a handoff packet by payload or file path."""
+        """Import a handoff packet by payload or confined file path."""
         if packet is None and path is None:
             raise ValueError("provide either packet (dict) or path (str)")
-        payload: Any = packet if packet is not None else path
+        payload: Any = packet
+        if payload is None:
+            raw_path = str(path or "").strip()
+            if not raw_path:
+                return {"status": "invalid", "reason": "missing_path"}
+            confined = _confine_handoff_path(raw_path, grounding_root)
+            if confined is None:
+                return dict(_HANDOFF_PATH_REJECTED)
+            payload = confined
         return get_runtime().import_handoff(payload, source_agent_id=source_agent_id, thread_id=thread_id)
 
     @server.tool(
@@ -187,17 +304,22 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
         description=(
             "Re-verify facts' checksummed evidence items against the live files: "
             "re-reads each source at the stored line range and compares the "
-            "recomputed checksum. Returns changed/missing verdicts. Use dry_run "
+            "recomputed checksum. Returns changed/missing/unverifiable verdicts. "
+            "Paths are always resolved under the server source root: absolute "
+            "source ids and ids escaping the root are reported as unverifiable, and the "
+            "legacy source_root argument is deprecated and ignored. Use dry_run "
             "to preview; dry_run=false writes evidence_stale flags onto facts, "
             "which surface in the stale_claims view, briefs (STALE EVIDENCE) and "
             "the snapshot metric."
         ),
     )
     def check_drift(thread_id: str = "", source_root: str = "", dry_run: bool = True) -> Dict[str, Any]:
-        """Re-verify grounded evidence against live files."""
-        return get_runtime().check_evidence_stale(
-            thread_id=thread_id,
-            source_root=source_root or grounding_root,
+        """Re-verify grounded evidence against live files (server-confined)."""
+        del source_root  # deprecated and ignored: never let a caller pick the root
+        return _check_drift_confined(
+            get_runtime(),
+            thread_id=str(thread_id or ""),
+            source_root=grounding_root,
             dry_run=bool(dry_run),
         )
 
@@ -210,9 +332,9 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
             "of seen/ingested/invalid rows."
         ),
     )
-    def reconcile(thread_id: str, limit: int = 50) -> Dict[str, Any]:
+    def reconcile(thread_id: str = "", limit: int = 50) -> Dict[str, Any]:
         """Run the optional state reconciliation hook."""
-        return get_runtime().reconcile(thread_id, limit=int(max(1, int(limit))))
+        return get_runtime().reconcile(_resolve_thread(thread_id), limit=int(max(1, int(limit))))
 
     @server.tool(
         name="snapshot",
@@ -232,15 +354,16 @@ def register_tools(server: Any, get_runtime: Callable[[], Any], *, source_root: 
         title="Prune rows older than TTL",
         description=(
             "TTL archival: delete memory rows older than ttl_hours (default 720h / "
-            "30 days; rows without a parseable timestamp are always kept). Use "
-            "dry_run=true to preview counts without deleting."
+            "30 days; rows without a parseable timestamp are always kept). "
+            "dry_run defaults to true so an accidental call only previews counts; "
+            "pass dry_run=false explicitly to permanently delete rows."
         ),
     )
     def prune(
         thread_id: str = "",
         ttl_hours: float = 720.0,
         ttl_hours_facts: Optional[float] = None,
-        dry_run: bool = False,
+        dry_run: bool = True,
     ) -> Dict[str, Any]:
         """Prune memory rows older than the TTL."""
         return get_runtime().prune(

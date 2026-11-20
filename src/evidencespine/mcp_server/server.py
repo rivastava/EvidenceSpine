@@ -6,6 +6,8 @@ imported lazily inside functions only; importing this module never requires it.
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import os
 import threading
 from typing import Any, Optional
@@ -35,6 +37,46 @@ def _build_runtime(
 def _grounding_root() -> str:
     settings = EvidenceSpineSettings.from_env()
     return os.path.realpath(settings.source_root or os.getcwd())
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_truthy(name: str) -> bool:
+    raw = os.getenv(name)
+    return raw is not None and str(raw).strip().lower() in _TRUTHY
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True for loopback bind hosts (127.0.0.1, ::1, localhost)."""
+    text = str(host or "").strip().lower()
+    if not text:
+        return False
+    if text == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(text.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _allow_unauthenticated() -> bool:
+    """Honor the explicit opt-in for unauthenticated non-loopback binds."""
+    try:
+        settings = EvidenceSpineSettings.from_env()
+        if bool(getattr(settings, "mcp_allow_unauthenticated", False)):
+            return True
+    except Exception:
+        pass
+    return _env_truthy("EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED")
+
+
+def _resolve_auth_token(settings: EvidenceSpineSettings) -> str:
+    """Resolve the MCP bearer token from settings, then environment."""
+    token = str(getattr(settings, "mcp_auth_token", "") or "").strip()
+    if not token:
+        token = str(os.getenv("EVIDENCESPINE_MCP_AUTH_TOKEN", "") or "").strip()
+    return token
 
 
 def create_server(
@@ -68,12 +110,11 @@ def create_server(
         return holder["runtime"]
 
     try:
-        from evidencespine.usage import usage_guide_markdown as _guide
+        from evidencespine.usage import mcp_instructions_markdown as _primer
 
-        _instructions = _guide()
-        # Codex reads MCP instructions on init; keep the head self-contained.
-        if len(_instructions) > 4000:
-            _instructions = _instructions[:4000]
+        # Condensed primer (<= 3800 chars) so MCP initialize instructions are
+        # self-contained instead of a mid-sentence truncation of the full guide.
+        _instructions = _primer()
     except Exception:
         _instructions = _SERVER_DESCRIPTION
     try:
@@ -92,27 +133,41 @@ def create_server(
             description=_SERVER_DESCRIPTION,
             version=__version__,
         )
-    register_tools(server, get_runtime, source_root=_grounding_root())
+    grounding_root = _grounding_root()
+    register_tools(server, get_runtime, source_root=grounding_root)
     register_resources(server, get_runtime)
-    register_prompts(server, get_runtime)
+    register_prompts(server, get_runtime, source_root=grounding_root)
     return server
 
 
 def _static_bearer_middleware(app: Any, token: str) -> Any:
-    """Wrap an ASGI app so every HTTP request must present ``Authorization: Bearer <token>``."""
+    """Wrap an ASGI app so every HTTP request must present ``Authorization: Bearer <token>``.
 
-    expected = "Bearer " + token
+    The token comparison is constant-time (``hmac.compare_digest``) so the
+    guard does not leak the expected credential through response timing.
+    """
+
+    expected = str(token or "").strip().encode("utf-8")
+    if not expected:
+        raise ValueError("_static_bearer_middleware requires a non-empty token")
 
     async def dispatch(scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
-        auth = ""
-        for key, value in scope.get("headers", []):
-            if key.lower() == b"authorization":
-                auth = value.decode("latin-1")
-                break
-        if auth != expected:
+        provided = b""
+        for key, value in scope.get("headers") or []:
+            if key.lower() != b"authorization":
+                continue
+            try:
+                raw = value.decode("latin-1")
+            except Exception:
+                raw = ""
+            scheme, _, credential = raw.partition(" ")
+            if scheme.strip().lower() == "bearer":
+                provided = credential.strip().encode("utf-8", "surrogateescape")
+            break
+        if not hmac.compare_digest(provided, expected):
             body = b'{"error":"invalid_token","error_description":"Authentication required"}'
             await send(
                 {
@@ -142,17 +197,36 @@ def run_server(
     storage_format: Optional[str] = None,
     runtime: Optional[AgentMemoryRuntime] = None,
 ) -> None:
-    """Run the EvidenceSpine MCP server (blocking)."""
+    """Run the EvidenceSpine MCP server (blocking).
+
+    Refuses to start an unauthenticated streamable-http server on a
+    non-loopback host unless EVIDENCESPINE_MCP_AUTH_TOKEN is set or
+    EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED is truthy.
+    """
     if transport not in {"stdio", "streamable-http"}:
         raise ValueError(f"unsupported transport: {transport!r}")
+    settings = EvidenceSpineSettings.from_env(base_dir=base_dir, storage_format=storage_format)
+    token = _resolve_auth_token(settings)
+    if transport == "streamable-http" and not token and not _is_loopback_host(host):
+        if not _allow_unauthenticated():
+            raise ValueError(
+                "refusing unauthenticated non-loopback MCP bind; set "
+                "EVIDENCESPINE_MCP_AUTH_TOKEN or "
+                "EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED=1"
+            )
+        print(
+            "WARNING: EvidenceSpine MCP streamable-http server is running "
+            "WITHOUT authentication on non-loopback host "
+            f"{host!r} because EVIDENCESPINE_MCP_ALLOW_UNAUTHENTICATED is set. "
+            "Anyone who can reach this port can read, write and prune memory.",
+            flush=True,
+        )
     server = create_server(base_dir=base_dir, storage_format=storage_format, runtime=runtime)
     if transport == "stdio":
         server.run(transport="stdio")
         return
     import uvicorn
 
-    settings = EvidenceSpineSettings.from_env(base_dir=base_dir, storage_format=storage_format)
-    token = str(settings.mcp_auth_token or "").strip()
     if not token:
         print(
             "WARNING: EvidenceSpine MCP streamable-http server is running "

@@ -112,12 +112,12 @@ class StoreBackend(ABC):
         ...
 
     @abstractmethod
-    def iter_events(self) -> Iterator[Dict[str, Any]]:
-        ...
+    def iter_events(self, thread_id: str = "") -> Iterator[Dict[str, Any]]:
+        """Iterate event rows in append order; optional thread_id filter."""
 
     @abstractmethod
-    def iter_facts(self) -> Iterator[Dict[str, Any]]:
-        ...
+    def iter_facts(self, thread_id: str = "") -> Iterator[Dict[str, Any]]:
+        """Iterate fact rows in append order; optional thread_id filter."""
 
     @abstractmethod
     def count_events(self) -> int:

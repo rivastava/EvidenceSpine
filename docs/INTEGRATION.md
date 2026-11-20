@@ -1,14 +1,60 @@
-# Integration Guide
+# Integration guide
 
-## 1) Add to any project
+EvidenceSpine is an evidence-bound memory side-car for coding agents. Anything
+that can run a process (MCP stdio), call HTTP, or import Python can use it.
+This guide starts with the portable path and then gives per-client quick
+starts; the complete per-client matrix is in
+[HARNESS_MATRIX.md](HARNESS_MATRIX.md).
 
-```bash
+## 1) Install
+
+```sh
 pip install evidencespine
 # or from source
 pip install -e /path/to/evidencespine
+
+# optional extras
+pip install "evidencespine[mcp]"          # MCP server
+pip install "evidencespine[a2a]"          # A2A server
+pip install "evidencespine[embeddings]"   # fastembed vector backend
 ```
 
-## 2) Minimal runtime integration
+## 2) Portable delivery in one command
+
+```sh
+cd /path/to/repo
+evidencespine harness install --harness all --target-dir .   # every supported target
+evidencespine harness doctor --target-dir . --json           # validate what was written
+evidencespine harness debug  --base-dir .evidencespine --json
+```
+
+Or install only what you use:
+
+```sh
+evidencespine harness install --harness claude-code      # skills-dir plugin + rules
+evidencespine harness install --harness codex            # .codex/config.toml + hooks
+evidencespine harness install --harness opencode         # .opencode/plugins/evidencespine.ts
+evidencespine harness install --harness cursor           # .cursor/mcp.json + rules
+evidencespine harness install --harness vscode-copilot   # portable .mcp.json
+evidencespine harness install --harness dsh              # $DSH_HOME/cordis.patch.yml
+evidencespine harness install --harness generic          # canonical + projections
+evidencespine harness install --harness agents-md        # AGENTS.md managed block
+evidencespine harness install --harness git              # post-commit/post-merge hooks
+```
+
+Installs are merge-preserving and idempotent: unrelated JSON/YAML/TOML is kept,
+hooks are appended and deduped, and an unparseable user file is never
+overwritten (a backup path is reported). Use `--dry-run` to preview. For
+clients with no installer (Windsurf/Devin, Zed, Gemini CLI, Antigravity,
+Cline, Roo, Continue, Junie, Warp, Amp, JetBrains, Claude Desktop) use:
+
+```sh
+evidencespine harness print-config --harness windsurf
+evidencespine harness print-config --harness zed --scope global
+evidencespine harness print-config --harness all --json
+```
+
+## 3) Minimal runtime integration (Python)
 
 ```python
 from evidencespine.runtime import AgentMemoryRuntime
@@ -18,20 +64,19 @@ settings = EvidenceSpineSettings.from_env(base_dir=".evidencespine")
 runtime = AgentMemoryRuntime(config=settings.to_runtime_config())
 
 runtime.ingest_event({
-    "thread_id": "session_1",
+    "thread_id": "session_1",              # or let the CLI/harness resolve the workspace thread
     "event_type": "decision",
     "source_agent_id": "agent_a",
     "source_turn_id": "t-12",
     "payload": {"claim": "Use strategy B", "fact_state": "verified"},
-    "evidence_refs": ["decision_log.md#L10"],
-    "evidence_items": [
-        {
-            "source_id": "decision_log.md",
-            "line_start": 10,
-            "line_end": 12,
-            "excerpt": "Use strategy B",
-        }
-    ],
+    "evidence_refs": ["decision_log.md#L10-L12"],
+    "evidence_items": [{
+        "source_id": "decision_log.md",
+        "line_start": 10,
+        "line_end": 12,
+        "excerpt": "Use strategy B",
+        "checksum": "sha256:<sha256 of the excerpt>",
+    }],
     "state_context": {
         "scope_id": "strategy-b-rollout",
         "state_kind": "agent_local_work",
@@ -47,358 +92,307 @@ print(brief.to_dict())
 print(runtime.query_view("active_scopes", thread_id="session_1").to_dict())
 ```
 
-`build_brief(...).to_dict()` now emits structured `citations` plus a legacy `citation_refs` alias.
-`query_view(...)` gives agents a compact current-state surface without tailing raw JSONL.
+Grounding is mandatory for `"verified"`: without a checksummed excerpt (or
+verification provenance) the claim is stored as `asserted` and the result
+reports `policy_downgrades`. Prefer letting the CLI ground the span for you
+(see below) instead of hand-computing checksums.
 
-## 2a) Minimal CLI integration
+## 4) Minimal CLI integration
 
-```bash
+```sh
 evidencespine ingest \
-  --thread-id session_1 \
-  --event-type decision \
-  --source-agent-id agent_a \
-  --source-turn-id t-12 \
-  --claim "Use strategy B" \
-  --fact-state verified \
-  --scope-id strategy-b-rollout \
-  --state-kind agent_local_work \
-  --status active \
-  --owner-agent-id agent_a \
-  --evidence-ref "decision_log.md#L10" \
-  --evidence-item-json '{"source_id":"decision_log.md","line_start":10,"line_end":12,"excerpt":"Use strategy B"}' \
-  --json
+  --thread-id session_1 --event-type decision --source-agent-id agent_a \
+  --source-turn-id t-12 --claim "Use strategy B" --fact-state verified \
+  --ground-ref "decision_log.md#L10-L12" \
+  --scope-id strategy-b-rollout --state-kind agent_local_work \
+  --status active --owner-agent-id agent_a --json
 
+evidencespine brief --thread-id session_1 --query "what matters now" --json
 evidencespine view active-scopes --thread-id session_1 --json
 ```
 
-## 3) Multi-agent handoff
+Exit codes are machine-consumable: `0` ok/deduped/no-op, `2`
+invalid/missing/ungroundable, `3` fail-open/disabled/partial, and
+`migrate` verification mismatch exits `1`. Add `--json` for the payload.
 
-```python
-packet = runtime.emit_handoff(role="auditor", thread_id="session_1", scope="verify claims")
-runtime.import_handoff(packet.to_dict(), source_agent_id="auditor_agent")
+## 5) MCP clients (stdio first, HTTP when remote)
+
+Register this command as a stdio MCP server:
+
+```sh
+evidencespine mcp --base-dir /absolute/path/to/repo/.evidencespine
 ```
 
-Handoff claim rows preserve `state_context` when the brief claim carried it, so ownership and gate freshness survive role changes.
+An absolute `--base-dir` avoids surprises when the client's cwd differs.
+Tools: `ingest_event, build_brief, query_view, emit_handoff, import_handoff,
+ground, check_drift, verify_fact, reconcile, snapshot, prune`.
+Resources: `evidencespine://guide`, `//brief/{thread}`, `//view/{view}`,
+`//state/{scope}`, `//snapshot`. The server also sends the usage guide in
+`initialize.instructions`, so agents get the operating rules with no repo
+changes.
 
-## 4) Optional contradiction hook
+For a shared/remote surface, run streamable-HTTP and authenticate:
 
-```python
-from evidencespine.runtime import AgentMemoryRuntime, RuntimeHooks
-
-
-def contradiction_pass(query, facts):
-    # Return rows like: {"reason": "refute:fact_id"}
-    return []
-
-runtime = AgentMemoryRuntime(hooks=RuntimeHooks(contradiction_pass=contradiction_pass))
+```sh
+export EVIDENCESPINE_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+evidencespine mcp --transport streamable-http --host 127.0.0.1 --port 8000 --path /mcp
+# clients: {"type":"http","url":"http://127.0.0.1:8000/mcp",
+#           "headers":{"Authorization":"Bearer $EVIDENCESPINE_MCP_AUTH_TOKEN"}}
 ```
 
-Optional reconciliation hook:
+The server refuses unauthenticated non-loopback binds; TLS is not terminated by
+EvidenceSpine (put it behind a proxy). See [SECURITY.md](SECURITY.md).
 
-```python
-def reconcile_state(thread_id, active_scope_rows):
-    return [
-        {
-            "thread_id": thread_id,
-            "event_type": "reflection",
-            "source_agent_id": "runtime_probe",
-            "payload": {"claim": "release gate still blocked", "fact_state": "verified"},
-            "state_context": {
-                "scope_id": "release-gate",
-                "state_kind": "global_blocker",
-                "status": "blocked",
-                "state_basis": "runtime_validated",
-                "validated_at": "2026-03-18T09:30:00Z",
-                "validated_by": "smoke",
-                "fresh_until": "2026-03-18T10:30:00Z",
-            },
-        }
-    ]
+## 6) Per-client quick starts
 
-runtime = AgentMemoryRuntime(hooks=RuntimeHooks(reconcile_state=reconcile_state))
-runtime.reconcile("session_1")
+### Claude Code
+
+```sh
+evidencespine harness install --harness claude-code --target-dir .
+# launch Claude Code from the repo root, accept the workspace-trust dialog
+claude plugin validate --strict .claude/skills/evidencespine
+claude mcp list
 ```
 
-## 5) Hybrid retrieval mode
+Delivers SessionStart recall, PreCompact retention, SessionEnd ingest, a skill
+and `.claude/rules/evidencespine.md`. Settings hooks are opt-in
+(`--with-settings-hooks`; both copies would run). Details:
+[CLAUDE_CODE.md](CLAUDE_CODE.md).
 
-Retrieval uses BM25 lexical scoring (fallback: jaccard). Enable hybrid or
-vector mode and pick a vector backend:
+### Codex
 
-```bash
-export EVIDENCESPINE_RETRIEVAL_MODE=hybrid   # or vector
-export EVIDENCESPINE_RETRIEVAL_LEXICAL_WEIGHT=1.0
-export EVIDENCESPINE_RETRIEVAL_VECTOR_WEIGHT=0.35
-export EVIDENCESPINE_EMBEDDING_BACKEND=auto  # auto | fastembed | hashing
-export EVIDENCESPINE_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+```sh
+evidencespine harness install --harness codex --target-dir .   # or --scope global
+codex mcp list
+# project hooks need a one-time trust review: run /hooks in Codex
 ```
 
-- `auto` (default) uses fastembed when the `[embeddings]` extra is installed,
-  otherwise falls back to a dependency-free hashing backend.
-- `fastembed` requires the extra: `pip install evidencespine[embeddings]`.
-- `hashing` forces the dependency-free backend.
+Writes `.codex/config.toml` (safe TOML merge, stdio or `--mcp-url` HTTP) and
+`.codex/hooks.json` (SessionStart recall, SessionEnd retain, PreCompact
+ingest). Details: [CODEX.md](CODEX.md).
 
-Or inject your own backend:
+### opencode
 
-```python
-from evidencespine.runtime import AgentMemoryRuntime
-
-class MyVectorBackend:
-    def score_texts(self, query, texts):
-        return [0.0 for _ in texts]
-
-runtime = AgentMemoryRuntime(vector_backend=MyVectorBackend())
+```sh
+evidencespine harness install --harness opencode --target-dir .
+opencode plugin list
+opencode mcp list
 ```
 
-## 6) Transcript-first integration (recommended)
+Writes the V2 plugin `.opencode/plugins/evidencespine.ts`: MCP registration,
+`context` + `compaction` recall, tool-after capture, lifecycle stop.
+Requires opencode >= 2.x. Details: [OPENCODE.md](OPENCODE.md).
+
+### Cursor
+
+```sh
+evidencespine harness install --harness cursor --target-dir .
+```
+
+Writes `.cursor/mcp.json` (merge), `.cursor/rules/evidencespine.mdc`,
+`.cursor/permissions.json` and `.cursor/hooks.json`.
+
+### VS Code / Copilot
+
+```sh
+evidencespine harness install --harness vscode-copilot --target-dir .   # portable .mcp.json
+# legacy Local harness only:
+evidencespine harness install --harness vscode --target-dir .
+```
+
+Prefer `vscode-copilot`; the `vscode` target writes the deprecated
+`.vscode/mcp.json` `servers` shape. See the migration note in
+[HARNESS_MATRIX.md](HARNESS_MATRIX.md).
+
+### DeepSeek Harness
+
+```sh
+evidencespine harness install --harness dsh --target-dir /path/to/repo
+CLI="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+DSH_HOME="$HOME/.dsh" "$CLI" --dump-config --profile headless | grep -A12 evidencespine-mcp
+```
+
+Writes the machine-wide MCP client row with absolute paths and materializes the
+skill. Details: [DSH.md](DSH.md).
+
+### Generic MCP / anything else
+
+```sh
+evidencespine harness install --harness generic --target-dir .
+# canonical: evidencespine.mcp.json; projections: .mcp.json, .cursor/mcp.json,
+# .agents/mcp_config.json, .agents/.mcp.json, .continue/mcpServers/,
+# .junie/mcp/mcp.json, .roo/mcp.json
+```
+
+Any client that accepts `{"mcpServers": {"evidencespine": {"command": ...,
+"args": [...]}}}` can import the canonical file unchanged.
+
+### Git hooks
+
+```sh
+evidencespine harness install --harness git --target-dir .
+git commit -m "..."        # post-commit records the commit with grounded diff spans
+evidencespine harness git test-record --status passed --command "pytest tests/"
+```
+
+## 7) Thread identity
+
+One workspace shares one thread:
+
+```text
+explicit --thread-id > EVIDENCESPINE_THREAD_ID > proj_<sha1(realpath(git toplevel))[:12]>
+```
+
+Harness hooks, CLI, MCP and A2A resolve this server-side. Provider session ids
+are stored as `source_turn_id`/`metadata.session_id`, never as thread ids.
+Set `EVIDENCESPINE_THREAD_ID` only when you deliberately want isolation (for
+example one thread per incident instead of per repo).
+
+## 8) Agent workflow snippets
+
+### Implementer -> auditor handoff (Python)
 
 ```python
-from evidencespine import AgentMemoryRuntime, EvidenceSpineSettings
+# implementer side
+runtime.ingest_event({
+    "thread_id": "bugfix_auth_timeout", "event_type": "outcome",
+    "source_agent_id": "implementer", "source_turn_id": "turn_9",
+    "payload": {"claim": "retry timeout fixed in middleware",
+                "fact_state": "verified",
+                "verification": {"method": "test",
+                                 "reference": "pytest tests/test_middleware.py"}},
+})
+packet = runtime.emit_handoff("auditor", "bugfix_auth_timeout",
+                              scope="verify timeout edge cases")
+print(packet.to_dict()["file_path"])
+
+# auditor side (new session)
+runtime.import_handoff(packet.to_dict(), source_agent_id="auditor")
+brief = runtime.build_brief("bugfix_auth_timeout", "what must I validate first?")
+```
+
+### Golden loop (CLI)
+
+```sh
+# 1. orient
+evidencespine brief --thread-id proj_... --query "current goal" --json
+
+# 2. ground + record a decision/outcome
+evidencespine ingest --thread-id proj_... --event-type outcome \
+  --source-agent-id implementer --source-turn-id t1 \
+  --claim "fix shipped" --fact-state verified --ground-ref "src/mod.py#L10-L20"
+
+# 3. after editing cited files, re-verify
+evidencespine drift-check --thread-id proj_... --source-root .          # preview
+evidencespine drift-check --thread-id proj_... --source-root . --apply  # persist flags
+
+# 4. hand off
+evidencespine handoff --role auditor --thread-id proj_... --json
+evidencespine handoff --import .evidencespine/handoffs/<packet>.json --thread-id proj_...
+```
+
+### Golden loop (MCP tool names)
+
+1. `build_brief` / resource `evidencespine://brief/{thread}` at session start.
+2. `ingest_event` for decisions/outcomes; `ground` then attach items for
+   claims that matter, with `fact_state: "verified"`.
+3. `check_drift` after edits (default `dry_run=true`; pass
+   `dry_run=false` to write flags).
+4. `verify_fact` when a test/gate/tool verified the claim.
+5. `emit_handoff` / `import_handoff` at role boundaries.
+6. `query_view` (`contradictions`, `open_gates`, `stale_claims`) when
+   claims conflict or state matters.
+7. `snapshot` to check health; `prune` previews by default.
+
+## 9) Adapters (transcript-first integration)
+
+```python
 from evidencespine.adapters import TranscriptAdapter
 
-rt = AgentMemoryRuntime(config=EvidenceSpineSettings.from_env().to_runtime_config())
-adapter = TranscriptAdapter(rt, default_thread_id="thread_default")
-
-normalized = adapter.normalize_messages(
-    [
-        {"role": "user", "content": "Check drift"},
-        {
-            "role": "assistant",
-            "content": "Patch complete",
-            "evidence_items": [{"source_id": "patch.diff", "line_start": 7, "line_end": 9}],
-        },
-        {"role": "tool", "content": "pytest passed"},
-    ]
-)
-
-result = adapter.ingest_messages(normalized)
+adapter = TranscriptAdapter(runtime, default_thread_id="thread_default")
+result = adapter.ingest_messages([
+    {"role": "user", "content": "Check drift"},
+    {"role": "assistant", "content": "Patch complete",
+     "evidence_items": [{"source_id": "patch.diff", "line_start": 7, "line_end": 9}]},
+    {"role": "tool", "content": "pytest passed"},
+])
+print(result["status"])   # ok | partial | failed | disabled | invalid
 brief = adapter.brief("what matters now")
-handoff = adapter.handoff("auditor", "verify latest claims")
+packet = adapter.handoff("auditor", "verify latest claims")
 ```
 
-Use this when your runtime already exposes transcript-like `messages[]` and you want the smallest dependency-free integration surface.
-Caller-supplied `evidence_items` and `state_context` are preserved through normalization and ingestion; the adapter does not invent span or control-state data on its own.
+Ingest accounting is explicit: newly persisted events are `ingested`,
+replayed ones are `deduped` (`new_events` is an alias for `ingested`),
+and `partial`/`failed`/`disabled` are distinct statuses. Caller-provided
+`evidence_items` and `state_context` survive normalization; the adapter
+does not invent spans. Framework wrappers:
+`LangGraphAdapter` (`ingest_state`, `normalize_state`) and
+`AutoGenAdapter` (`ingest_messages`, `normalize_messages`). See
+[ADAPTERS.md](ADAPTERS.md).
 
-## 7) Framework wrappers (drop-in convenience)
+## 10) A2A, async runtime, retrieval
 
-```python
-from evidencespine import AgentMemoryRuntime, EvidenceSpineSettings
-from evidencespine.adapters import LangGraphAdapter, AutoGenAdapter
-
-rt = AgentMemoryRuntime(config=EvidenceSpineSettings.from_env().to_runtime_config())
-
-lg = LangGraphAdapter(rt, default_thread_id="thread_lg")
-lg.ingest_state({"messages": [{"role": "user", "content": "Check drift"}]})
-normalized_lg = lg.normalize_state({"messages": [{"role": "tool", "content": "pytest ok"}]})
-
-ag = AutoGenAdapter(rt, default_thread_id="thread_ag")
-ag.ingest_messages([{"source": "assistant", "content": "Patch complete"}])
-normalized_ag = ag.normalize_messages([{"source": "function", "content": "tool output"}])
-```
-
-These wrappers stay dependency-free. They are schema-level adapters, not hard integrations with the framework packages.
-
-## 8) Replay validation
-
-Run the bundled replay examples to inspect how raw traces become briefs and handoff packets:
-
-```bash
-PYTHONPATH=src python examples/transcript_replay_harness.py \
-  examples/replay_fixtures/implementer_auditor_trace.json
-
-PYTHONPATH=src python examples/langgraph_replay_demo.py
-```
-
-## 8a) MCP server (optional extra)
-
-```bash
-pip install "evidencespine[mcp]"
-evidencespine mcp                       # stdio transport
-evidencespine mcp --transport streamable-http --port 8000
-```
-
-Tools: `ingest_event`, `build_brief`, `query_view`, `emit_handoff`,
-`import_handoff`, `ground`, `check_drift`, `verify_fact`, `reconcile`,
-`snapshot`, `prune` (11 tools; server also advertises the usage-guide
-`instructions` primer for Codex/GUI discovery).
-
-Restart the MCP server after upgrading EvidenceSpine: hook commands spawn a
-fresh process per call, but a long-lived MCP server (stdio daemon,
-streamable-http) keeps serving the code it started with. `snapshot` reports
-`evidencespine_version` from the serving process; compare it against a fresh
-`harness debug` (which reports the installed version) and restart on mismatch.
-Resources: `evidencespine://brief/{thread_id}`, `evidencespine://view/{view}`,
-`evidencespine://state/{scope_id}`, `evidencespine://snapshot`.
-Prompts: `session_start`, `handoff_receive`, `handoff_send`.
-
-## 8b) Harness delivery layer (auto-recall / auto-retain)
-
-```bash
-evidencespine harness install --harness all
-evidencespine harness debug
-```
-
-Writes a Claude Code plugin manifest, an opencode plugin (brief injection at
-session start, retention through compaction, handoff on session end), and a
-Cursor MCP config. Session hooks fail open: without a store, `session-start`
-returns a one-line notice instead of failing the session.
-
-### Supported harness matrix
-
-| Harness | Install target | What is wired |
-| --- | --- | --- |
-| opencode | `.opencode/plugins/evidencespine.ts` (or global) | v2 plugin (`export default {id, setup}`): MCP transform, `session.hook("context")` recall, `tool.hook("execute.after")` capture, event-subscribe retain |
-| claude-code | `.claude-plugin/plugin.json` + `hooks/hooks.json` + `.mcp.json` + `.claude/settings.json` merge | session-start/end/precompact hooks (list-shape, envelope-aware) + MCP |
-| cursor | `.cursor/mcp.json` (merge) + `rules/evidencespine.mdc` + `permissions.json` + `hooks.json` | MCP registration, alwaysApply rules, allowlist, session hooks |
-| vscode | `.vscode/mcp.json` (`servers` key) | MCP registration (GUI-compatible) |
-| codex | `.codex/config.toml` + `.codex/hooks.json` | MCP + SessionStart/SessionEnd/PreCompact (Codex-first) |
-| agents-md | `AGENTS.md` (only when missing/appended) | GUI discovery for MCP-only clients |
-| git | `.git/hooks/` post-commit/post-merge | commit spans + test-record |
-
-The MCP server itself is harness-agnostic: any MCP-capable client (opencode,
-Cursor, Claude Code, Codex CLI/IDE/desktop, generic MCP apps) gets the same
-tools and resources, so agents reach the spine even without a harness install.
-A2A, the async runtime, the CLI, and the framework adapters
-(`TranscriptAdapter`, LangGraph, AutoGen) are additional harness-agnostic
-channels.
-
-### How agents discover EvidenceSpine
-
-Guidance reaches agents through three complementary layers:
-
-1. **`AGENTS.md` (committed at the repo root)** — the opencode, Codex, Cursor,
-   and Claude Code convention for agent instructions: a concise primer on what
-   the spine is and decision rules for when to consult it (consult a brief
-   before asserting project state; ground + mark verified when claiming
-   something is fixed; re-verify evidence after edits; import/emit handoffs at
-   role boundaries). The same file is read by all four harnesses — one source,
-   no per-harness instruction sets. It is generated from the canonical
-   `usage_guide_markdown()` constant (`src/evidencespine/usage.py`) and a sync
-   test fails if the two drift.
-2. **MCP tool and resource descriptions** — every tool teaches its own use
-   case; resources (`evidencespine://brief/{thread}`, `//view/{view}`,
-   `//state/{scope}`, `//snapshot`) are progressive-disclosure surfaces. The
-   `evidencespine://guide` resource mirrors the AGENTS.md rules for any MCP
-   agent at runtime.
-3. **The session-start injection** — the auto-recall brief opens with the
-   operating rules (locked decisions are binding unless superseded; act
-   against a verified fact only by recording the contradiction; open items and
-   next actions are the queue) plus the decision rules (consult the spine
-   before asserting project state; ground what you mark verified; re-verify
-   after edits; emit a handoff at role change), injected automatically by the
-   opencode plugin and claude-code hooks.
-
-## 8c) A2A protocol server (optional extra)
-
-```bash
+```sh
 pip install "evidencespine[a2a]"
+export EVIDENCESPINE_A2A_AUTH_TOKEN="$(openssl rand -hex 32)"
 evidencespine a2a --host 127.0.0.1 --port 8765
 curl http://127.0.0.1:8765/.well-known/agent-card.json
 ```
 
-The agent card advertises `memory.read`, `memory.write`, `memory.handoff`,
-and `memory.health` skills. Send an A2A message containing a JSON body
-`{"action": "build_brief", "thread_id": "...", "params": {...}}` (or plain
-text, treated as a brief query) to the JSON-RPC endpoint.
-
-## 8d) Async wrapper
+A2A operations: `ingest_event, append_fact, build_brief, query_view,
+emit_handoff, import_handoff, reconcile, snapshot, prune` (no ground/drift/
+verify). The agent card is public; every other path requires the bearer token
+when configured, and non-loopback binds without a token are refused. A2A
+`prune` deletes by default — pass `dry_run=true` explicitly.
 
 ```python
 from evidencespine import AsyncAgentMemoryRuntime
-
 rt = AsyncAgentMemoryRuntime(base_dir=".evidencespine")
 await rt.ingest_event({...})
 brief = await rt.build_brief("session_1", "what matters now")
 ```
 
-All blocking I/O runs in worker threads; methods mirror the sync runtime and
-return plain dicts.
+Retrieval modes: `EVIDENCESPINE_RETRIEVAL_MODE=lexical|hybrid|vector`
+(lexical default), `EVIDENCESPINE_EMBEDDING_BACKEND=auto|hashing|fastembed`.
 
-## 8e) TTL archival
+## 11) HTTP + auth summary
 
-```bash
-evidencespine prune --ttl-hours 720 --dry-run --json   # preview
-evidencespine prune --ttl-hours 720 --json            # delete old rows
-```
+- MCP: `EVIDENCESPINE_MCP_AUTH_TOKEN` -> static bearer on every HTTP request,
+  constant-time compare, non-loopback refusal, no OAuth, no TLS termination.
+- A2A: `EVIDENCESPINE_A2A_AUTH_TOKEN` -> same model, public agent card.
+- Per-client header/env syntax differs; see the env-dialect table in
+  [HARNESS_MATRIX.md](HARNESS_MATRIX.md).
 
-Rows without a parseable timestamp are always kept. The runtime method
-`runtime.prune(...)` and the MCP `prune` tool expose the same behavior.
+## 12) Troubleshooting
 
-## 8f) Realtime debate chat
+| Symptom | Check / fix |
+|---|---|
+| Client sees no tools | `evidencespine harness doctor --target-dir . --json`; is the executable on the client's PATH/absolute? For Claude Code, launch from the repo root and accept workspace trust. For Codex, run `/hooks` trust review. |
+| Hooks never fire | Hooks fail open silently; check the client's hook log/debug output and that the installed file is the one the client reads (see matrix). |
+| Brief is empty or `stale: true` | Expected on a fresh store or when no events fall inside the 168 h lookback; rely on the repo and ingest state as you work. |
+| "verified" claim shows as asserted | It was ungrounded: attach a checksummed excerpt (`--ground-ref` / `ground`) or verification provenance. The ingest result's `policy_downgrades` says how many. |
+| Handoff import fails | Packet must validate (`role`, `thread_id`, `scope`, `claims`); path imports must be relative to `EVIDENCESPINE_SOURCE_ROOT`. Stale rows import as asserted. |
+| Store in the wrong place | Pass absolute `--base-dir`; harness installers emit absolute paths where the client cannot resolve relative ones. |
+| MCP server returns old behavior after upgrade | Long-lived servers keep start-time code: compare `snapshot.evidencespine_version` with `harness debug` and restart. |
+| HTTP client gets 401 | Token not set/rotated, or header missing. Restart the server after changing `EVIDENCESPINE_MCP_AUTH_TOKEN`. |
 
-`evidencespine chat` turns the spine into a live message bus: one polling
-loop per role, each reading the room from the store, replying through an LLM
-backend, and publishing back. Agents read each other's messages before every
-reply; the debate ends on consensus (`AGREE:` from every role), a quiet
-period, a message budget, or a duration cap.
+## 13) Operational checklist
 
-```bash
-# quick debate with the default roles
-evidencespine chat --topic "Is this feature worth building?"
+- Persist events with evidence refs/items for claims that matter.
+- Mark fact state correctly; never claim verified without grounding.
+- Build a brief before major actions and role changes.
+- Query `active_scopes` / `open_gates` before switching roles.
+- Emit a handoff when switching roles or ending a session.
+- Drift-check after editing cited files; trust the flag over the claim.
+- Watch `snapshot()` for citation coverage, stale evidence and fail-open
+  counts.
 
-# long, self-sustaining session (see docs/DEBATE.md for the full runbook)
-evidencespine chat --topic "<topic>" --minutes 45 --facilitate \
-  --max-messages 200 --window-size 12 --max-reply-words 40
-```
+## See also
 
-Chat messages are stored as room events (monotonic `chat_seq`), never as
-facts, so they do not pollute briefs. See `docs/DEBATE.md` for all controls
-and the opencode verification notes.
-
-## 8g) Grounded evidence: spans, policy, drift, provenance
-
-Grounded evidence binds claims to exact, checksummed file excerpts.
-
-```bash
-# build a grounded evidence item from a file:line ref
-evidencespine ground "src/mod.py#L10-L20"
-
-# ingest a verified claim that is actually grounded (survives the policy)
-evidencespine ingest --claim "fix shipped" --fact-state verified \
-  --ground-ref "src/mod.py#L10-L20" --thread-id demo --event-type outcome \
-  --source-agent-id me --source-turn-id t1
-
-# policy: fact_state=verified without a grounded item or provenance is
-# stored as asserted (metadata.policy = verified_requires_span).
-# Disable with EVIDENCESPINE_VERIFIED_REQUIRES_SPAN=0.
-
-# drift-check: re-verify grounded evidence against live files
-evidencespine drift-check --source-root .            # preview
-evidencespine drift-check --source-root . --apply    # write evidence_stale flags
-# stale facts surface in `view stale_claims`, briefs (STALE EVIDENCE risks),
-# and the snapshot metric agent_evidence_stale_count_24h.
-
-# provenance: record how a fact was verified (test/gate/tool/manual)
-evidencespine verify --fact-id amf_... --method test \
-  --reference "pytest tests/test_mod.py" --verified-by qa
-```
-
-The same operations are MCP tools: `ground`, `check_drift`, `verify_fact`.
-
-## 8h) Thin git/test hooks
-
-```bash
-# install post-commit + post-merge hooks (span ingestion per commit)
-evidencespine harness git install-hook --target-dir . --executable evidencespine
-
-# manual commit record with grounded spans from diff hunks
-evidencespine harness git git-hook --sha <sha> --repo-dir .
-
-# record a test run (green -> verified fact with provenance)
-evidencespine harness git test-record --status passed --command "pytest tests/"
-```
-
-## 9) Operational checklist
-- Persist events with evidence refs.
-- Mark fact state correctly (asserted vs verified).
-- Use `state_context` for gates, blockers, ownership, and freshness when those semantics matter.
-- Generate brief before each major agent action.
-- Use `query_view("active_scopes")` or the CLI `view` command before role changes.
-- Emit handoff packet when switching role/agent.
-- Watch `snapshot()` metrics for stale or low citation coverage.
-
-## Claude Code
-
-For a Claude Code specific workflow, see:
-- `docs/CLAUDE_CODE.md`
-- `examples/claude_code_usage.py`
-- `docs/ADAPTERS.md`
+- [HARNESS_MATRIX.md](HARNESS_MATRIX.md) — all clients, paths, shapes, grades
+- [CLAUDE_CODE.md](CLAUDE_CODE.md), [CODEX.md](CODEX.md),
+  [OPENCODE.md](OPENCODE.md), [DSH.md](DSH.md)
+- [PROTOCOL.md](PROTOCOL.md), [ARCHITECTURE.md](ARCHITECTURE.md),
+  [SECURITY.md](SECURITY.md), [ADAPTERS.md](ADAPTERS.md),
+  [BENCHMARKS.md](BENCHMARKS.md)
+- Canonical agent playbook: `AGENTS.md` / `evidencespine://guide`
